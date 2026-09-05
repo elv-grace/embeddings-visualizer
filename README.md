@@ -1,7 +1,7 @@
 # embeddings-visualizer
 Visualize vectors in an index in a latent space.
 
-Prototype of a visual (graphic) interface for an index using SigLIP2-base-naflex embeddings.
+Prototype of a visual (graphic) interface for an index using SigLIP2-base-naflex embeddings. (built with Claude Code)
 
 **Plan:**
 
