@@ -1,0 +1,11 @@
+flask>=3.0
+requests>=2.25
+numpy>=1.24
+scikit-learn>=1.3
+umap-learn>=0.5.5
+
+# Query embedding only. The service starts and projects an index without a GPU;
+# only a search loads the model.
+torch>=2.0
+transformers>=4.45
+pillow>=10.0

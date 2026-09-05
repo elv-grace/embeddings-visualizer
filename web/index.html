@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Embeddings Visualizer</title>
+<link rel="stylesheet" href="style.css">
+<!-- deck.gl standalone bundle: exposes a global `deck`. Pinned so a CDN
+     republish cannot change the renderer under us. Chosen over a hand-rolled
+     canvas because it picks hover targets on the GPU (exact at any node count)
+     and because its OrbitView makes a 3D mode a view swap rather than a
+     rewrite, should the 2D map ever prove too cramped. -->
+<script src="https://unpkg.com/deck.gl@9.0.27/dist.min.js"></script>
+<!-- elv-client-js's prebuilt FrameClient (UMD, exposes window.FrameClient).
+     Vendored rather than imported because this app has no build step; refresh
+     it from elv-core-js/node_modules/@eluvio/elv-client-js/dist when that
+     package is upgraded. Only used when running inside core's iframe. -->
+<script src="vendor/ElvFrameClient-min.js"></script>
+<!-- Chrome cannot play HLS natively, and clip playout is served as HLS. Safari
+     can, and hls.js refuses to attach there — media.js branches on that. -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.5.17/hls.min.js"></script>
+</head>
+<body>
+
+<header id="bar">
+  <span class="brand">Embeddings<b>Visualizer</b></span>
+
+  <label class="field grow">
+    <span>Index QID</span>
+    <input id="index-qid" type="text" placeholder="iq__..." spellcheck="false" autocomplete="off">
+  </label>
+
+  <label class="field grow">
+    <span>Sources <em>(optional, comma-separated)</em></span>
+    <input id="sources" type="text" placeholder="hqpe..." spellcheck="false" autocomplete="off">
+  </label>
+
+  <label class="field narrow">
+    <span>Sample</span>
+    <input id="sample-size" type="number" min="1" step="500" value="10000">
+  </label>
+
+  <!-- PCA and UMAP fail in opposite directions, so both stay reachable:
+       PCA keeps real distances but barely separates clusters; UMAP separates
+       clusters but its 2D distances mean nothing. -->
+  <div class="field narrow">
+    <span>Projection</span>
+    <div class="toggle" id="method">
+      <button data-method="umap" class="on">UMAP</button>
+      <button data-method="pca">PCA</button>
+    </div>
+  </div>
+
+  <!-- The index records no model, so the modes it can be queried in are
+       declared here. See the TODO in src/embedder.py. -->
+  <div class="field narrow">
+    <span>Query modes</span>
+    <div class="modes" id="modes">
+      <label><input type="checkbox" value="text" checked> text</label>
+      <label><input type="checkbox" value="image" checked> image</label>
+      <label><input type="checkbox" value="video"> video</label>
+    </div>
+  </div>
+
+  <button id="load" class="primary">Load</button>
+</header>
+
+<main id="stage">
+  <div id="canvas"></div>
+
+  <div id="empty" class="overlay">
+    <h1>Nothing loaded</h1>
+    <p>Enter an index QID and press <b>Load</b> to project its vectors.</p>
+  </div>
+
+  <div id="busy" class="overlay" hidden>
+    <div class="spinner"></div>
+    <p id="busy-text">Loading…</p>
+  </div>
+
+  <!-- Legend doubles as a modality filter. The query row, when present, toggles
+       its neighbour links instead of filtering. -->
+  <div id="legend" hidden></div>
+
+  <div id="zoom" hidden>
+    <button id="zoom-in" title="Zoom in" aria-label="Zoom in">+</button>
+    <button id="zoom-out" title="Zoom out" aria-label="Zoom out">−</button>
+    <button id="zoom-fit" title="Fit to data" aria-label="Fit to data">
+      <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
+        <path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"
+              fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+      </svg>
+    </button>
+  </div>
+
+  <div id="stats" hidden></div>
+
+  <!-- Follows the cursor on hover. -->
+  <div id="tip" hidden></div>
+
+  <!-- Opens on click. Shows the frame, the text or the clip; falls back to bare
+       metadata when the modality cannot be determined. -->
+  <aside id="detail" hidden>
+    <button class="close" id="detail-close" aria-label="Close">×</button>
+    <div id="detail-body"></div>
+  </aside>
+
+  <div id="search">
+    <button id="search-toggle" aria-label="Search" title="Search">
+      <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+        <circle cx="11" cy="11" r="6.5" fill="none" stroke="currentColor" stroke-width="2"/>
+        <path d="M16 16l5 5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+      </svg>
+    </button>
+
+    <div id="search-panel" hidden>
+      <div class="tabs" id="search-tabs">
+        <button data-mode="text" class="on">Text</button>
+        <button data-mode="image">Image</button>
+        <button data-mode="video">Video</button>
+      </div>
+
+      <div class="pane" data-pane="text">
+        <input id="q-text" type="text" placeholder="Describe what should be visible…" autocomplete="off">
+        <button id="q-text-go" class="primary">Search</button>
+      </div>
+      <div class="pane" data-pane="image" hidden>
+        <input id="q-image" type="file" accept="image/*">
+      </div>
+      <div class="pane" data-pane="video" hidden>
+        <input id="q-video" type="file" accept="video/*">
+      </div>
+
+      <p id="search-error" class="error" hidden></p>
+      <p id="search-note" hidden></p>
+    </div>
+  </div>
+</main>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>
