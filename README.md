@@ -337,7 +337,14 @@ to end in a browser:
 
 Two additions on the core side, both on branch `embeddings-visualizer`:
 
-- `config/configuration.js` — `"Embeddings Visualizer": "http://localhost:8099"`
+- `config/configuration.js` — `"Embeddings Visualizer": "http://localhost:8099"`,
+  placed **last** in the `apps` object. `AppInfo.jsx` sorts nothing: an app is in
+  the Application Suite only if it matches its `appNames` list and is a Tool
+  otherwise, and both boxes render in this object's key order. So position in
+  that file *is* position in the box.
+- No core-side icon: `AppInfo.jsx` falls back to `<app url>/Logo.png` for
+  anything absent from its icon map, and `web/Logo.png` answers that — which
+  keeps the artwork with the app rather than adding an import to core.
 - `src/stores/index.js` — added to `darkChromeApps`, since this app is always
   dark and a light core header above a dark iframe reads as a seam.
 
