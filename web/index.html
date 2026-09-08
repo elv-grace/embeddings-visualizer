@@ -30,10 +30,15 @@
     <input id="index-qid" type="text" placeholder="iq__..." spellcheck="false" autocomplete="off">
   </label>
 
+  <!-- Sources filter removed from the header: viewers should not need to
+       narrow an index by source part hash. The vectorstore still accepts the
+       filter and `get_vectors` still takes `sources`, so this is a UI removal
+       only — restore the field if a case for it appears.
   <label class="field grow">
     <span>Sources <em>(optional, comma-separated)</em></span>
     <input id="sources" type="text" placeholder="hqpe..." spellcheck="false" autocomplete="off">
   </label>
+  -->
 
   <label class="field narrow">
     <span>Sample</span>
@@ -51,9 +56,13 @@
     </div>
   </div>
 
-  <!-- The index records no model, so the modes it can be queried in are
-       declared here. See the TODO in src/embedder.py. -->
-  <div class="field narrow">
+  <!-- Sits beside Sample and Projection, the two controls whose effect on the
+       picture is not self-evident. -->
+  <button id="help-toggle" class="help" title="How to use" aria-label="How to use">?</button>
+
+  <!-- Only used when the index's tags carry no stamped recipe. When they do,
+       the model and its query modes are detected and these are disabled. -->
+  <div class="field narrow" id="modes-field">
     <span>Query modes</span>
     <div class="modes" id="modes">
       <label><input type="checkbox" value="text" checked> text</label>
@@ -67,6 +76,46 @@
 
 <main id="stage">
   <div id="canvas"></div>
+
+  <div id="help" hidden>
+    <div class="help-card">
+      <button class="close" id="help-close" aria-label="Close">×</button>
+      <h2>How to use</h2>
+
+      <p class="lede">Enter an index QID and press <b>Load</b> to fetch its
+      vectors and plot each one as a node. Both controls below take effect on the
+      next <b>Load</b>.</p>
+
+      <h3>Sample</h3>
+      <p>How many vectors to fetch and plot. The index is counted first and the
+      sample drawn proportionally across its whole timeline, so a smaller number
+      still spans the entire index rather than taking the first N of it.</p>
+      <p>Lower is faster and gives a sparser map; higher is denser and slower to
+      project. An index holding fewer vectors than this is plotted in full.</p>
+
+      <h3>Projection</h3>
+      <p>Vectors have ~1000 dimensions and a screen has two, so they have to be
+      flattened. The two methods lose different things:</p>
+      <dl class="help-list">
+        <dt>UMAP</dt>
+        <dd>Separates clusters clearly, so groupings are easy to see. Distance
+        between points is <b>not</b> meaningful — only which nodes cluster
+        together. Takes a few seconds to fit.</dd>
+        <dt>PCA</dt>
+        <dd>Keeps real distances and global structure, and is instant, but its
+        two axes hold only about a fifth of the variation here — so the map tends
+        to look like one undifferentiated cloud.</dd>
+      </dl>
+      <p>Switching re-projects the same vectors: it changes the picture, not the
+      data.</p>
+
+      <h3>Reading the map</h3>
+      <p>Because any projection distorts, a node sitting near a query on screen
+      is not necessarily one of its closest matches. Search results are ranked in
+      the vectors' original dimensions and drawn as <b>links</b> from the query
+      node — trust those, not what looks near.</p>
+    </div>
+  </div>
 
   <div id="empty" class="overlay">
     <h1>Nothing loaded</h1>

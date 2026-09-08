@@ -21,11 +21,19 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 from flask import Flask, jsonify, request, send_from_directory
 
-from embedder import DEFAULT_MAX_NUM_PATCHES, DEFAULT_MODEL_ID, DEFAULT_REVISION, EmbeddingError, QueryEmbedder
+from embedder import (
+    DEFAULT_MAX_NUM_PATCHES,
+    DEFAULT_MODEL_ID,
+    DEFAULT_REVISION,
+    EmbeddingError,
+    QueryEmbedder,
+    build_embedder,
+)
+from recipes import Recipe, read_recipes
 from projection import METHODS, Projector, ProjectionError, anchor_to_neighbours, top_k_similar
 from vectors_api import DEFAULT_SAMPLE_SIZE, VectorStoreError, get_track_counts, get_vectors, modality
 
-PORT = 8096
+PORT = 8099
 
 # Modes a caller may declare. The index does not record which model built it, so
 # the caller supplies the model and its modes; see embedder.py's docstring.
@@ -54,7 +62,21 @@ class LoadedIndex:
     modes: List[str]
     model_id: str
     tracks: Dict[str, int] = field(default_factory=dict)
+    # Per-track recipes read off the search rows. Empty when the content was
+    # tagged before taggers stamped `additional_info`, which is when the
+    # caller-declared model and modes are used instead.
+    recipes: Dict[str, Recipe] = field(default_factory=dict)
     embedder: Optional[QueryEmbedder] = None
+
+    @property
+    def recipe(self) -> Optional[Recipe]:
+        """The recipe to embed a query with.
+
+        One index can hold tracks from different taggers, but a query has to be
+        embedded with one model, so this takes the first and the response
+        reports every recipe found for the caller to notice a mismatch.
+        """
+        return next(iter(self.recipes.values()), None)
 
 
 _indexes: Dict[str, LoadedIndex] = {}
@@ -105,6 +127,13 @@ def create_app(static_dir: str = "../web") -> Flask:
         except Exception:
             tracks = {}
 
+        # The recipe the tagger stamped, read off the rows already fetched --
+        # the vectorstore returns additional_info verbatim on every search hit.
+        recipes = read_recipes(metadata)
+        if recipes:
+            detected = next(iter(recipes.values()))
+            modes = detected.query_modes or modes
+
         matrix = np.asarray(vectors, dtype=np.float32)
         projector = Projector(method=method, seed=seed)
         try:
@@ -124,8 +153,13 @@ def create_app(static_dir: str = "../web") -> Flask:
                 coords=coords,
                 projector=projector,
                 modes=modes,
-                model_id=body.get("model_id") or DEFAULT_MODEL_ID,
+                model_id=(
+                    recipes[next(iter(recipes))].embedder
+                    if recipes
+                    else (body.get("model_id") or DEFAULT_MODEL_ID)
+                ),
                 tracks=tracks,
+                recipes=recipes,
             )
 
         return jsonify(
@@ -138,9 +172,12 @@ def create_app(static_dir: str = "../web") -> Flask:
                 "count": len(metadata),
                 "vector_size": int(matrix.shape[1]),
                 "tracks": tracks,
+                # Empty when nothing was stamped; the UI then says the model and
+                # modes were declared rather than detected.
+                "recipes": {t: r.to_json() for t, r in recipes.items()},
                 "bbox": projector.bbox,
                 "explained_variance": projector.explained_variance,
-                "points": _points(coords, metadata),
+                "points": _points(coords, metadata, recipes),
             }
         )
 
@@ -160,12 +197,23 @@ def create_app(static_dir: str = "../web") -> Flask:
             return _error(f"Index does not support {mode} embeddings.", 422)
 
         if loaded.embedder is None:
-            loaded.embedder = QueryEmbedder(
-                model_id=loaded.model_id,
-                revision=DEFAULT_REVISION,
-                max_num_patches=DEFAULT_MAX_NUM_PATCHES,
-                target_size=int(loaded.vectors.shape[1]),
-            )
+            width = int(loaded.vectors.shape[1])
+            try:
+                # A stamped recipe names the model and the parameters its vectors
+                # were produced under; without one, fall back to the defaults the
+                # caller declared against.
+                loaded.embedder = (
+                    build_embedder(loaded.recipe, width)
+                    if loaded.recipe
+                    else QueryEmbedder(
+                        model_id=loaded.model_id,
+                        revision=DEFAULT_REVISION,
+                        max_num_patches=DEFAULT_MAX_NUM_PATCHES,
+                        target_size=width,
+                    )
+                )
+            except EmbeddingError as exc:
+                return _error(str(exc), 422)
 
         try:
             if mode == "text":
@@ -175,7 +223,16 @@ def create_app(static_dir: str = "../web") -> Flask:
                 upload = request.files.get("file")
                 if upload is None:
                     return _error("a file upload is required for this mode", 400)
-                vector = loaded.embedder.embed_image(upload.stream)
+                if mode == "video":
+                    embed_video = getattr(loaded.embedder, "embed_video", None)
+                    if embed_video is None:
+                        return _error(
+                            f"{loaded.model_id} cannot embed video queries", 422
+                        )
+                    # The filename carries the container suffix the decoder picks by.
+                    vector = embed_video(upload.stream, upload.filename)
+                else:
+                    vector = loaded.embedder.embed_image(upload.stream)
         except EmbeddingError as exc:
             return _error(str(exc), 400)
         except Exception as exc:
@@ -230,14 +287,28 @@ def create_app(static_dir: str = "../web") -> Flask:
     return app
 
 
-def _points(coords: np.ndarray, metadata: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """The per-node payload: position, modality, and the metadata for the card."""
+def _points(
+    coords: np.ndarray,
+    metadata: List[Dict[str, Any]],
+    recipes: Optional[Dict[str, Recipe]] = None,
+) -> List[Dict[str, Any]]:
+    """The per-node payload: position, modality, and the metadata for the card.
+
+    Modality comes from the track's stamped `kind` when there is one, and only
+    falls back to inferring it from populated fields otherwise. The inference is
+    wrong for whole-video tags — start == end == 0 and no frame_idx reads as
+    "unknown" — which is exactly what `kind` exists to settle.
+    """
+    recipes = recipes or {}
     return [
         {
             "i": i,
             "x": float(coords[i][0]),
             "y": float(coords[i][1]),
-            "modality": modality(meta),
+            "modality": (
+                (recipes.get(meta.get("track") or "") or Recipe(embedder="")).modality
+                or modality(meta)
+            ),
             "meta": meta,
         }
         for i, meta in enumerate(metadata)

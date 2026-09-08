@@ -54,6 +54,7 @@ const state = {
   hidden: new Set(),   // modalities toggled off in the legend
   hovered: null,
   selected: null,
+  selectedQuery: null,   // the detail panel shows a point or a query, never both
   // Queries accumulate rather than replacing each other: comparing where two
   // searches land in one space is the point of plotting them at all.
   // Each: {id, n, x, y, mode, label, neighbours, pinned, linksVisible, alpha,
@@ -126,6 +127,11 @@ function formatTime(ms) {
   const m = Math.floor(t / 60000);
   const s = Math.floor((t % 60000) / 1000);
   return `${sign}${m}:${String(s).padStart(2, "0")}.${String(t % 1000).padStart(3, "0")}`;
+}
+
+/** "google/siglip2-base-patch16-naflex" -> "siglip2-base-patch16-naflex". */
+function shortModel(id) {
+  return truncate(String(id || "unknown").split("/").pop(), 34);
 }
 
 function truncate(value, max = 30) {
@@ -316,7 +322,7 @@ function buildLayers() {
         // them so they survive the pointer leaving.
         pickable: true,
         onHover: onQueryHover,
-        onClick: (info) => (info.object ? togglePin(info.object) : null),
+        onClick: (info) => (info.object ? selectQuery(info.object) : null),
       }),
       // The number is what ties a node to its legend row, and what tells two
       // queries of the same mode apart once they share a colour.
@@ -394,16 +400,36 @@ function togglePin(q) {
   drawLegend();
 }
 
+/** Stop a query's timers and release the blob URL holding its uploaded file. */
+function disposeQuery(q) {
+  clearLinkTimers(q);
+
+  // Empty anything still showing the preview before revoking it: an <img> left
+  // pointing at a revoked blob reports a failed load, which is console noise and
+  // nothing else. The tooltip counts — it keeps the last thumbnail it rendered.
+  if (state.selectedQuery?.id === q.id) {
+    state.selectedQuery = null;
+    $("detail").hidden = true;
+    $("detail-body").innerHTML = "";
+  }
+  $("tip").hidden = true;
+  $("tip").innerHTML = "";
+  if (q.preview) {
+    URL.revokeObjectURL(q.preview);
+    q.preview = null;
+  }
+}
+
 function removeQuery(id) {
   const q = state.queries.find((x) => x.id === id);
-  if (q) clearLinkTimers(q);
+  if (q) disposeQuery(q);
   state.queries = state.queries.filter((x) => x.id !== id);
   drawLegend();
   render();
 }
 
 function clearQueries() {
-  state.queries.forEach(clearLinkTimers);
+  state.queries.forEach(disposeQuery);
   state.queries = [];
   state.nextQueryN = 1;
   drawLegend();
@@ -516,12 +542,15 @@ function onQueryHover(info) {
        <span class="dot" style="background:${rgbCss(queryColor(q.mode))}"></span>
        <span class="mode">${q.n} · ${q.mode} query</span>
      </div>
+     ${q.preview && q.mode === "image"
+        ? `<img class="query-thumb" src="${q.preview}" alt="">`
+        : ""}
      <p class="query-label">${escapeHtml(q.label || "")}</p>
      ${dl([
        ["neighbours", q.neighbours?.length ?? 0],
        ["best cos", best ? best.similarity.toFixed(3) : "—"],
      ])}
-     <p class="text">${q.pinned ? "Click to unpin links." : "Click to pin links."}</p>`,
+     <p class="text">Click to open this query and pin its links.</p>`,
     info
   );
 }
@@ -544,8 +573,67 @@ function showTip(html, info) {
   tip.style.top = `${Math.max(0, y)}px`;
 }
 
+/** Open the detail panel on a query, showing what was actually searched with.
+ *
+ * For an uploaded image or clip the file itself is shown, not its name — the
+ * name says nothing about whether the right file was picked, and the whole
+ * question a viewer has about an image query is what the image was.
+ */
+function selectQuery(q) {
+  state.selected = null;
+  state.selectedQuery = q;
+  $("search-panel").hidden = true;
+  teardownMedia();
+
+  // Opening a query pins its links: the panel and the links answer the same
+  // question, so having them come and go separately just makes work.
+  if (!q.pinned) {
+    q.pinned = true;
+    holdLinks(q);
+  }
+
+  const best = q.neighbours?.[0];
+  $("detail-body").innerHTML = `
+    <h2>
+      <span class="dot" style="background:${rgbCss(queryColor(q.mode))}"></span>
+      ${q.n} · ${MODALITY[q.mode]?.label || q.mode} query
+    </h2>
+    ${queryMediaHtml(q)}
+    <div class="section">Query</div>
+    ${dl([
+      ["mode", q.mode],
+      ["neighbours", q.neighbours?.length ?? 0],
+      ["best cos", best ? best.similarity.toFixed(3) : "—"],
+    ])}
+    <button id="query-pin" class="wide">${q.pinned ? "Unpin links" : "Pin links"}</button>`;
+  $("detail").hidden = false;
+  drawLegend();
+  render();
+
+  $("query-pin").addEventListener("click", () => {
+    togglePin(q);
+    $("query-pin").textContent = q.pinned ? "Unpin links" : "Pin links";
+  });
+}
+
+function queryMediaHtml(q) {
+  if (q.mode === "text") {
+    return `<p class="quote">${escapeHtml(q.label || "")}</p>`;
+  }
+  if (!q.preview) {
+    // Only reachable if the blob URL was released while the query lived on.
+    return `<div class="placeholder">${escapeHtml(q.label || "uploaded file")}</div>`;
+  }
+  const media =
+    q.mode === "video"
+      ? `<video src="${q.preview}" controls playsinline></video>`
+      : `<img src="${q.preview}" alt="${escapeHtml(q.label || "query image")}">`;
+  return `${media}<p class="caption">${escapeHtml(truncate(q.label || "", 40))}</p>`;
+}
+
 function select(point) {
   state.selected = point;
+  state.selectedQuery = null;
   $("search-panel").hidden = true;
   teardownMedia();
 
@@ -634,6 +722,18 @@ function wireUnlock(point) {
   input.focus();
 }
 
+/** How a clip's extent reads.
+ *
+ * An unsegmented whole-video vector carries start == end == 0, and playback
+ * treats that as "no out point" and runs the whole thing — so labelling it
+ * `0:00.000 – 0:00.000` would claim a zero-length clip while the full video is
+ * playing.
+ */
+function clipRange(meta) {
+  if (!(meta.end_time > meta.start_time)) return "Whole video";
+  return `Clip ${formatTime(meta.start_time)} – ${formatTime(meta.end_time)}`;
+}
+
 /** Fetch the frame or the clip and swap it into the open panel. */
 async function loadMedia(point) {
   const client = frameClient();
@@ -665,7 +765,7 @@ async function loadMedia(point) {
     host.innerHTML = `
       <video id="clip" controls playsinline></video>
       <p class="caption">
-        Clip ${formatTime(meta.start_time)} – ${formatTime(meta.end_time)}
+        ${clipRange(meta)}
         <button id="clip-replay">Replay</button>
       </p>`;
 
@@ -754,10 +854,39 @@ function drawLegend() {
     }));
 }
 
+/** Reflect whether the model/modes were detected or declared by hand.
+ *
+ * A stamped recipe is authoritative, so the manual checkboxes are disabled
+ * rather than left looking like they still decide anything.
+ */
+function applyRecipes(data) {
+  const recipes = Object.values(data.recipes || {});
+  const detected = recipes.length > 0;
+
+  document.querySelectorAll("#modes input").forEach((input) => {
+    input.disabled = detected;
+    if (detected) input.checked = data.modes.includes(input.value);
+  });
+  $("modes-field").title = detected
+    ? `Detected from the index's tags: ${data.model_id}`
+    : "This index's tags carry no embedding recipe, so declare its query modes here.";
+  $("modes-field").classList.toggle("detected", detected);
+  return detected ? recipes[0] : null;
+}
+
 function drawStats(data) {
+  const recipe = applyRecipes(data);
   const parts = [
     `<b>${data.count.toLocaleString()}</b> vectors · <b>${data.vector_size}</b> dims · ${data.method.toUpperCase()}`,
   ];
+
+  // Naming the source matters: "declared" means nothing verified that the model
+  // shown is the one that built these vectors.
+  if (recipe) {
+    parts.push(`model <b>${escapeHtml(shortModel(recipe.embedder))}</b> · detected from tags`);
+  } else {
+    parts.push(`model <b>${escapeHtml(shortModel(data.model_id))}</b> · <span class="warn">declared, not detected</span>`);
+  }
   if (data.method === "pca") {
     // Worth surfacing: two PCA components typically retain only ~20% of the
     // variance, which is why the cloud looks undifferentiated.
@@ -784,7 +913,8 @@ async function loadIndex() {
   if (!token) return alert("An auth token is required.");
 
   const modes = [...document.querySelectorAll("#modes input:checked")].map((i) => i.value);
-  const sources = $("sources").value.split(",").map((s) => s.trim()).filter(Boolean);
+  // const sources = $("sources").value.split(",").map((s) => s.trim()).filter(Boolean);
+  const sources = [];   // the header no longer exposes a sources filter
   const method = document.querySelector("#method .on").dataset.method;
 
   $("empty").hidden = true;
@@ -815,9 +945,10 @@ async function loadIndex() {
     state.hidden.clear();
     // Coordinates come from a projection fitted to this index, so queries
     // plotted against the previous one mean nothing here.
-    state.queries.forEach(clearLinkTimers);
+    state.queries.forEach(disposeQuery);
     state.queries = [];
     state.nextQueryN = 1;
+    state.selectedQuery = null;
     $("detail").hidden = true;
     $("search-error").hidden = true;
     $("search-note").hidden = true;
@@ -840,7 +971,7 @@ async function loadIndex() {
 
 /* ---------------------------------------------------------------- search */
 
-async function runSearch(mode, payload, label) {
+async function runSearch(mode, payload, label, preview) {
   if (!state.indexKey) return alert("Load an index first.");
 
   const err = $("search-error");
@@ -861,6 +992,7 @@ async function runSearch(mode, payload, label) {
       y: data.query_point.y,
       mode: data.mode,
       label,
+      preview,
       neighbours: data.neighbours,
       pinned: false,
       linksVisible: false,
@@ -914,7 +1046,9 @@ function searchFile(mode, input) {
   const form = new FormData();
   form.append("index_key", state.indexKey);
   form.append("file", file);
-  return runSearch(mode, { method: "POST", body: form }, file.name);
+  // Kept so the query node can show what was actually uploaded rather than its
+  // filename. Revoked in disposeQuery.
+  return runSearch(mode, { method: "POST", body: form }, file.name, URL.createObjectURL(file));
 }
 
 /* ---------------------------------------------------------------- wiring */
@@ -928,6 +1062,12 @@ document.querySelectorAll("#method button").forEach((b) =>
     b.classList.add("on");
   }));
 
+const showHelp = (on) => { $("help").hidden = !on; };
+$("help-toggle").addEventListener("click", () => showHelp($("help").hidden));
+$("help-close").addEventListener("click", () => showHelp(false));
+// Clicks land on the backdrop only when they miss the card.
+$("help").addEventListener("click", (e) => { if (e.target.id === "help") showHelp(false); });
+
 $("zoom-in").addEventListener("click", () => zoomBy(ZOOM_STEP));
 $("zoom-out").addEventListener("click", () => zoomBy(-ZOOM_STEP));
 $("zoom-fit").addEventListener("click", zoomToFit);
@@ -935,6 +1075,7 @@ $("zoom-fit").addEventListener("click", zoomToFit);
 $("detail-close").addEventListener("click", () => {
   $("detail").hidden = true;
   state.selected = null;
+  state.selectedQuery = null;
   teardownMedia();
   render();
 });
@@ -990,9 +1131,11 @@ $("canvas").addEventListener("mouseleave", () => {
 window.addEventListener("resize", render);
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
+  $("help").hidden = true;
   $("detail").hidden = true;
   $("search-panel").hidden = true;
   state.selected = null;
+  state.selectedQuery = null;
   teardownMedia();
   render();
 });

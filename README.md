@@ -38,7 +38,7 @@ Prototype of a visual (graphic) interface for an index using SigLIP2-base-naflex
 
 ```
 pip install -r requirements.txt
-python3 src/app.py            # http://localhost:8096
+python3 src/app.py            # http://localhost:8099
 ```
 
 Two different tokens are involved. The **index** token authorizes the vectorstore
@@ -48,14 +48,29 @@ content object, and is only ever asked for standalone — see *Media*.
 
 ## Layout
 
+Backend (Python):
+
 | | |
 |---|---|
-| `src/vectors_api.py` | reads vectors + metadata out of the vectorstore |
-| `src/projection.py`  | PCA → UMAP down to 2D, and the query's out-of-sample placement |
-| `src/embedder.py`    | SigLIP 2 towers for embedding a text or image query |
-| `src/app.py`         | HTTP service; serves the API and the frontend from one origin |
-| `web/media.js`       | resolves a vector's metadata into a frame image or a clip |
-| `web/`               | the rest of the frontend (deck.gl, no build step) |
+| `src/app.py`          | HTTP service; serves the API and the frontend from one origin |
+| `src/vectors_api.py`  | enumerates and samples an index out of the vectorstore |
+| `src/recipes.py`      | parses the embedding recipe a tagger stamped on each vector |
+| `src/projection.py`   | PCA → UMAP to 2D, plus the query's neighbour anchoring |
+| `src/embedder.py`     | SigLIP 2 towers, and the recipe → embedder registry |
+| `src/qwen_embedder.py`| Qwen3-VL text/image/**video** queries, via the tagger's embedder |
+
+Frontend (JavaScript, no build step):
+
+| | |
+|---|---|
+| `web/index.html` | header controls, the help panel, and the stage's overlays |
+| `web/app.js`     | deck.gl layers, queries, the legend, and the detail panel |
+| `web/media.js`   | turns a vector's metadata into a frame image or a playable clip |
+| `web/style.css`  | the dark palette, including the modality colours `app.js` mirrors |
+| `web/vendor/`    | elv-client-js's prebuilt `FrameClient` (used only inside core) |
+
+Two API endpoints: `POST /api/index` loads, samples and projects an index;
+`POST /api/search/<mode>` embeds a query and ranks it. Everything else is static.
 
 ## How it works
 
@@ -102,7 +117,54 @@ image→image scores ~0.5 and two adjacent frames score ~0.95. Link opacity is
 therefore scaled within a result set, not against an absolute range, and the UI
 says to compare within a mode rather than across.
 
-**Modality** comes from which fields a row populates, in order: `text` → `text`;
+**The embedding recipe comes from the tags, not the index.** A tagger stamps
+`additional_info` on every tag it writes — `embedder`, `revision`, `dim`,
+`normalize`, `kind`, `query_modes`, plus whatever else changes the vector
+(`max_num_patches` for SigLIP 2; `prompt`, `fps`, `max_frames`, `max_length` for
+Qwen). The vectorstore stores it as JSONB and returns it **verbatim on every
+search hit**, so the recipe arrives on the same row as the vector and no second
+lookup is needed — `read_recipes` parses what `get_vectors` already fetched. It
+is opaque to the index though: not indexed and not filterable, so it can ride
+along but cannot narrow a search.
+
+It answers the two things the index cannot: which model to embed a query with,
+and which query modes that model supports. When a recipe is found the query mode
+checkboxes are filled in and disabled; when there is none they stay editable and
+the header says **declared, not detected** — an index tagged before taggers
+started stamping has no recipe, which today is all of them.
+
+`build_embedder` dispatches on the checkpoint id and threads every recipe
+parameter into the embedder, so a query is embedded under the recipe its index
+was built with. An unrecognised embedder raises rather than falling back to
+SigLIP 2: querying with the wrong model does not fail, it quietly returns
+meaningless neighbours.
+
+**Query towers are imported from the taggers, not reimplemented.** Whatever
+produced the indexed vectors has to produce the query vector too, and a mismatch
+in preprocessing, pooling or normalize does not raise — it quietly returns bad
+neighbours. So both embedders run the tagger's own code:
+
+- `src/qwen_embedder.py` wraps `Qwen3VLEmbedder`, whose `process()` already takes
+  text, image and video uniformly, so the query side just supplies
+  `{text|image|video, instruction, fps, max_frames}`. Video uploads go to a temp
+  file keeping their suffix, since the reader opens paths and picks its decoder
+  by extension.
+- `src/embedder.py`'s image path runs the SigLIP tagger's `FeatureExtractor`,
+  falling back to a local vision tower when the tagger is not importable. The
+  two were checked against each other on a real frame: **bit-identical**, max
+  absolute difference `0.000e+00`. Its *text* path has no counterpart to import
+  — that tagger only ever loads the vision tower — so the text tower is
+  necessarily query-side code.
+
+Both resolve the tagger the same way: plain import first (`/elv` is the tagger
+container's WORKDIR and already on `sys.path`), then `QWEN_EMBEDDING_PATH` /
+`SIGLIP_EMBEDDING_PATH`, then a sibling checkout. No home paths.
+
+**Modality** comes from the track's stamped `kind` when there is one. `kind` is
+what the vectors *are*, which settles a case the field heuristic gets wrong: an
+unsegmented whole-video tag carries `start == end == 0` and no `frame_idx`, so
+the heuristic reads it as `unknown` and refuses to play the clip. Without a
+recipe it falls back to which fields a row populates, in order: `text` → `text`;
 `frame_idx` → `image`; `end_time` strictly greater than `start_time` → `video`;
 otherwise `unknown`, which shows metadata and does not try to load media. The
 order matters — frame rows carry `start_time == end_time`, because a frame is an
@@ -128,6 +190,25 @@ true neighbours' plotted positions instead. Sharpening the weights keeps it
 beside its best match rather than drifting into the empty space between
 scattered ones. The raw projected point is still returned as `projected_point`
 for comparison; nothing is drawn at it.
+
+**Clicking a query node opens the query itself**, and pins its links — the panel
+and the links answer the same question, so having them appear and disappear
+separately just makes work. For an uploaded image or clip the panel shows the
+file, not its name: the name says nothing about whether the right file was
+picked, and what the image was is the whole question a viewer has about an image
+query. The upload is held as a blob URL for the query's lifetime and revoked
+when it is removed.
+
+**Video plays in both places, from two different sources.** Clicking a *vector*
+whose modality is video streams the fabric clip; clicking a *query* node plays
+the file that was uploaded, straight from its blob URL — no fabric and no content
+token involved. Both render a `<video>` with controls.
+
+Only the vector's playback is bounded, and only when there is a real interval:
+it seeks to `start_time` and pauses at `end_time`, but an unsegmented whole-video
+vector carries `start == end == 0`, which reads as "no out point" and plays the
+whole thing. Its caption says **Whole video** rather than `0:00.000 – 0:00.000`,
+which would claim a zero-length clip while the full video is running.
 
 **Queries accumulate.** A new search adds a node rather than replacing the last
 one, because comparing where two searches land is the reason to plot them at all.
@@ -175,17 +256,25 @@ Clips are bounded client-side: playback seeks to `start_time` and pauses at
 
 ## Verified against the live vectorstore
 
-`vectorstore-swagger.yaml` in content-search describes `/spaces` with
-`embedding_size`, while the deployment serves `/indexes` with `vector_size` and
-accepts `include_vector`. The spec is out of sync, so these were checked
-directly (2026-09-04, against the frame index):
+`vectorstore-swagger.yaml` in content-search is a **stale copy of the `/spaces`
+spec**: it describes `embedding_size` where the deployment serves `/indexes` with
+`vector_size`, omits `include_vector`, and its `VectorResponse` predates
+`additional_info` — as does content-search's own `Vector` dataclass, which has no
+such field and drops it when parsing. Treat <https://docs.eluv.io/api/vectorstore/>
+as authoritative, not the checked-in YAML. Checked directly (2026-09-04, against
+the frame index):
 
 - `start_time_gte` / `start_time_lte`, `track` and `sources` all filter for real.
 - Unknown body fields are ignored **silently** — a typo'd filter reads as no filter.
 - `start_time` is an **Int4**: a bound above 2147483647 fails with a 500, not an
   empty result. `MAX_START_TIME_MS` sits on that ceiling.
-- `GET /indexes/{qid}` returns only `{qid, vector_size}` — no config, no model.
+- `GET /indexes/{qid}` returns only `{qid, vector_size}` — the *index* cannot say
+  which model built it. A *vector* can: `additional_info` round-trips per search
+  hit, which is where the recipe comes from.
 - The tracks response keys each entry `name`, not `track`.
+- An absent key is not a missing column. Captured rows in
+  `vector_metainfo_data_ref.txt` show no `additional_info` only because those
+  tags never set one — Go's `omitempty` elides it.
 
 ## Verified against the live fabric
 
@@ -194,7 +283,11 @@ to end in a browser:
 
 - The frame endpoint returns a real 640×480 JPEG at the requested timestamp.
 - A clip reaches `readyState 4` with the content's true duration (1342 s), seeks
-  to its in-point and pauses itself at its out-point.
+  to its in-point and pauses itself at its out-point. A vector with
+  `start == end == 0` instead plays on past 14 s without pausing — the
+  whole-video case behaving as intended.
+- An uploaded video query plays from its blob URL (`readyState 4`, the upload's
+  own 4.2 s duration), so a query clip needs neither the fabric nor a token.
 - `?authorization=` is accepted on every one of these endpoints, so the
   standalone path needs no core and no keys.
 - **Permissions are per-capability.** A token that reads `/meta/offerings` (200)
@@ -204,16 +297,25 @@ to end in a browser:
 
 ## Open items
 
-- **The index does not record which model built it.** Neither the index metadata
-  nor the per-vector metadata carries a model id, so the query model and the
-  modes it supports are declared in the UI. Getting a model id written into the
-  index config at creation time is the real fix, and would also let the
-  unsupported-mode check derive itself.
-- **`src/embedder.py` is a third copy** of a contract that already exists in
-  content-search and in the tagger. All three must agree on checkpoint,
-  revision, `normalize`, `max_num_patches` and the text tower's
-  `max_length=64`, or query vectors land in a different space — and a mismatch
-  does not raise, it just returns bad neighbours.
+- **Nothing is stamped yet.** The recipe path is wired and unit-tested against
+  captured row shapes, but it has never parsed a real recipe: the tagger change
+  lives only in `model-vector` locally and the frame index predates it, so its
+  rows carry no `additional_info`. Re-tag content and detection takes over on
+  its own; until then every index falls back to the declared model.
+- **The Qwen path has never run.** `QwenQueryEmbedder` is wired, dispatched to
+  and unit-tested for construction and parameter threading, but no query has
+  been embedded through it — the Qwen index is empty, and the tagger's
+  dependencies (`qwen-vl-utils`, `decord`) are not installed here. It will load
+  the checkpoint on the first query against a Qwen index.
+- **One recipe per index.** A query has to be embedded with one model, so if an
+  index mixes tracks from different taggers the first recipe wins. All of them
+  are returned in `recipes` so a mismatch is at least visible.
+- **The SigLIP text tower is still query-side code.** The image half now runs the
+  tagger's own `FeatureExtractor`, so that contract cannot drift. The text half
+  has nothing to import — the tagger only ever loads the vision tower — so its
+  `padding="max_length"`, `max_length=64` tokenization is duplicated with
+  content-search's copy, and a mismatch there does not raise, it just returns
+  bad neighbours.
 - **Payload size.** Points serialize at ~376 B each because `index_id`,
   `batch_id` and `qid` repeat per row. Hoisting the constant fields would cut a
   50k-point load from ~19 MB to a few MB.
@@ -234,7 +336,7 @@ to end in a browser:
 
 Two additions on the core side, both on branch `embeddings-visualizer`:
 
-- `config/configuration.js` — `"Embeddings Visualizer": "http://localhost:8096"`
+- `config/configuration.js` — `"Embeddings Visualizer": "http://localhost:8099"`
 - `src/stores/index.js` — added to `darkChromeApps`, since this app is always
   dark and a light core header above a dark iframe reads as a seam.
 

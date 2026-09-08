@@ -23,6 +23,9 @@ caller instead.
 
 from __future__ import annotations
 
+import os
+import sys
+from pathlib import Path
 from typing import IO, Dict, List, Optional, Sequence
 
 import numpy as np
@@ -52,8 +55,49 @@ def _resolve_device_dtype(dtype: Optional[torch.dtype]):
     return device, torch.float32  # half precision is unstable/slow on CPU
 
 
+SIGLIP_PATH_CANDIDATES = (
+    "/elv",
+    str(Path(__file__).resolve().parents[2] / "model-vector" / "model-siglip2-frame-vector"),
+)
+
+
+def _load_tagger_extractor():
+    """The tagger's own `FeatureExtractor`, or None if it is not importable.
+
+    Same resolution order as `qwen_embedder`: plain import (inside the tagger's
+    container `/elv` is WORKDIR and already on `sys.path`), then
+    `SIGLIP_EMBEDDING_PATH`, then a sibling checkout.
+    """
+    paths = [os.environ["SIGLIP_EMBEDDING_PATH"]] if os.environ.get("SIGLIP_EMBEDDING_PATH") else []
+    paths += list(SIGLIP_PATH_CANDIDATES)
+    for path in [None] + paths:
+        if path is not None:
+            if not Path(path, "siglip_frame", "model.py").is_file():
+                continue
+            if path not in sys.path:
+                sys.path.insert(0, path)
+        try:
+            from siglip_frame.config import RuntimeConfig
+            from siglip_frame.model import FeatureExtractor
+
+            return FeatureExtractor, RuntimeConfig
+        except ImportError:
+            continue
+    return None
+
+
 class Siglip2ImageEmbedder:
-    """Embeds an image query as a single vector via SigLIP 2's image tower."""
+    """Embeds an image query with the tagger's own vision tower.
+
+    The image half is where a mismatch is both silent and fatal — preprocessing
+    budget, pooling and normalize all move the vector — so it runs the tagger's
+    `FeatureExtractor` rather than a parallel implementation of it. The local
+    tower below is the fallback for when the tagger is not importable, and is
+    kept byte-for-byte equivalent.
+
+    The text half has no counterpart to import: this tagger only ever loads the
+    vision tower, so `Siglip2TextEmbedder` is necessarily query-side code.
+    """
 
     def __init__(
         self,
@@ -63,14 +107,26 @@ class Siglip2ImageEmbedder:
         revision: Optional[str] = DEFAULT_REVISION,
         dtype: Optional[torch.dtype] = None,
     ) -> None:
-        from transformers import Siglip2ImageProcessor, Siglip2VisionModel
-
         if max_num_patches < 1:
             raise EmbeddingError(f"max_num_patches must be >= 1, got {max_num_patches!r}")
         self.normalize = normalize
         self.max_num_patches = max_num_patches
         self.device, self.dtype = _resolve_device_dtype(dtype)
 
+        tagger = _load_tagger_extractor()
+        if tagger is not None:
+            FeatureExtractor, RuntimeConfig = tagger
+            cfg = RuntimeConfig(normalize=normalize, max_num_patches=max_num_patches)
+            self._extractor = FeatureExtractor(
+                cfg, model_id=model_id, revision=revision, dtype=dtype
+            )
+            self.processor = self._extractor.processor
+            self.model = self._extractor.model
+            return
+
+        from transformers import Siglip2ImageProcessor, Siglip2VisionModel
+
+        self._extractor = None
         # Vision tower only; transformers logs the checkpoint's text-tower keys as
         # UNEXPECTED, which is the discarded half and is expected.
         self.processor = Siglip2ImageProcessor.from_pretrained(model_id, revision=revision)
@@ -80,6 +136,9 @@ class Siglip2ImageEmbedder:
         self.model.eval()
 
     def embed_image(self, img: np.ndarray) -> np.ndarray:
+        if self._extractor is not None:
+            return self._extractor._embed_frame(img)
+
         inputs = self._preprocess(img)
         with torch.no_grad():
             # .float() before normalizing: dividing in bf16 lands ~0.1% off unit
@@ -175,6 +234,47 @@ class QueryEmbedder:
 
     def _to_index_width(self, vector: Sequence[float]) -> List[float]:
         return pad_vector([float(x) for x in vector], self.target_size)
+
+
+def build_embedder(recipe, target_size: int) -> QueryEmbedder:
+    """Pick and configure a query embedder from a tagger's stamped recipe.
+
+    Dispatch is on the checkpoint id rather than a `kind`, because what a query
+    has to be embedded *with* is the model, not what the indexed vectors are.
+    Every recipe parameter that changes a vector is threaded through, so a query
+    is embedded under the same recipe the index was built with.
+
+    An unrecognised embedder raises rather than falling back to SigLIP 2: a
+    wrong-model query does not fail, it silently returns meaningless neighbours.
+    """
+    embedder = (recipe.embedder or "").lower()
+
+    if "siglip" in embedder:
+        return QueryEmbedder(
+            model_id=recipe.embedder,
+            revision=recipe.revision,
+            normalize=recipe.normalize,
+            max_num_patches=int(recipe.params.get("max_num_patches", DEFAULT_MAX_NUM_PATCHES)),
+            target_size=target_size,
+        )
+
+    if "qwen" in embedder:
+        # Imported here: qwen_embedder imports back for pad_vector/EmbeddingError.
+        from qwen_embedder import QwenQueryEmbedder
+
+        return QwenQueryEmbedder(
+            model_id=recipe.embedder,
+            revision=recipe.revision,
+            normalize=recipe.normalize,
+            target_size=target_size,
+            # dim is the MRL width; the rest of the sampling budget rides in params.
+            params={**recipe.params, "dim": recipe.dim},
+        )
+
+    raise EmbeddingError(
+        f"no query embedder is registered for {recipe.embedder!r}; "
+        "add one rather than querying with a different model"
+    )
 
 
 def pad_vector(vec: List[float], target_size: int) -> List[float]:
