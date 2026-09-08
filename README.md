@@ -1,9 +1,10 @@
 # embeddings-visualizer
 Visualize vectors in an index in a latent space.
 
-Prototype of a visual (graphic) interface for an index using SigLIP2-base-naflex embeddings.
+Prototype of a visual (graphic) interface for an index using SigLIP2-base-naflex embeddings. (built with Claude Code)
 
 **Plan:**
+
 0. Get index qid from user.
    - iq__WAmru89ENrPpgmhQpBcXeVeuQUq has just frame_vectors (SigLIP 2)
    - iq__8MzaWjtTDuWuyTjAazYWnQDwPew will have just video_vectors (Qwen) but is currently empty (need to update Qwen tagger with newest commit first)
