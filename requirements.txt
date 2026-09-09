@@ -9,3 +9,24 @@ umap-learn>=0.5.5
 torch>=2.0
 transformers>=4.45
 pillow>=10.0
+
+# Qwen indexes only. A SigLIP-only deployment never imports these, and the
+# service starts, loads and projects any index without them -- only a query
+# against a Qwen-stamped index does, which is why they are listed apart.
+#
+# These are the runtime of the tagger's own embedder, which this service imports
+# from source (see qwen_embedder) rather than installing. Note that it is only
+# the *source* that is shared: model-qwenvl-video-vector/setup.py pins
+# torch==2.8.* and torchvision>=0.23,<0.24, and those pins do NOT apply here
+# because that package is never installed. Verified 2026-09-09 against
+# torch 2.13 / torchvision 0.28 / transformers 5.12.1 -- every deep transformers
+# path the tagger imports still resolves, and a text and an image query both
+# returned results.
+#
+# Nothing below pins torch, so a plain install is safe; `--no-deps` is a
+# reasonable belt-and-braces on a machine whose torch build is not from PyPI
+# (e.g. a +cuXXX wheel that pip might otherwise decide to "fix").
+qwen-vl-utils>=0.0.14
+decord>=0.6.0       # video reader for qwen-vl-utils; av is the fallback
+accelerate>=1.12.0
+psutil              # accelerate needs it, and it is not always present already

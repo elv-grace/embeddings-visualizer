@@ -1,26 +1,27 @@
 # embeddings-visualizer
 Visualize vectors in an index in a latent space.
 
-Prototype of a visual (graphic) interface for an index using SigLIP2-base-naflex embeddings. (built with Claude Code)
+Prototype of a visual (graphic) interface for an index using SigLIP2-base-naflex or Qwen3-VL-Embedding-8B embeddings. (built with Claude Code)
 
 **Plan:**
 
 0. Get index qid from user.
    - iq__WAmru89ENrPpgmhQpBcXeVeuQUq has just frame_vectors (SigLIP 2)
-   - iq__8MzaWjtTDuWuyTjAazYWnQDwPew will have just video_vectors (Qwen) but is currently empty (need to update Qwen tagger with newest commit first)
+   - iq__8MzaWjtTDuWuyTjAazYWnQDwPew has just video_vectors (Qwen) segmented by shot by the tagger
 1. API call to vector store to get vectors in an index. (May visualize all or a subset (top 500?) of them.)
    - extract the metadata
-      - embedding model info for index
-   - how to pass auth token ? - use elv-client-js to get auth token that is passed to backend API call to vectorstore
+      - embedding model info for index - currently in vector's additional_info, but there might be a way to get it from the tagstore without having it repeated in each vector?
+   - auth token handled by integration with elv-core
 2. Visual:
    - grid/graph background, Eluvio/EVIE color scheme (purplish)
    - each vector as a node
    - hover over a node highlights it and shows the vector's formatted metadata
      - if it is embedded text, show the text too
-   - different colors for different modality embeddings (vector for text vs. image vs. video)? with a key/legend in the corner?
+   - different colors for different modality embeddings (vector for text vs. image vs. video) with a key/legend in the corner
+      - embedding model modality support also in vector's additional_info
       - if there is a frame_idx, show that frame/image
       - if there's text, show the text
-      - if it's a video, play the clip from start_time to end_time
+      - if it's a video, play the clip from start_time to end_time (or whole video if start_time=end_time=0 as in current model-qwen-video-vector model)
 3. Search:
    - search box in a corner
    - search query (text, image, or video) is embedded (using the vectors' embedding model (get from index)) and inserted as a new node in the same latent space (similar color to the query mode)
@@ -28,9 +29,9 @@ Prototype of a visual (graphic) interface for an index using SigLIP2-base-naflex
          - video query breaks for now ? (unless Qwen)
      - later: add check ?
 4. Media content:
-   - if a vector is an embedded photo or bounding box or video, show the media content (retrieve from fabric):
-      - point at elv-core-js and EVIE and have Claude determine how to get the playout as a pop-up
-      - tell it app should be embeddable/plug-in-able (new localhost in configuration.js) in core-js so it can access private keys, and codebase matters for future manageability -
+   - if a vector is an embedded photo or bounding box or video, show the media content (retrieve from fabric by integrating with elv-core (determined by Claude))
+      - app should be embeddable/plug-in-able (new localhost in configuration.js) in core-js so it can access private keys
+      - codebase matters for future manageability
          - should be in JavaScript (except for maybe embeddings and projection (PCA) in Python backend (no Claude comments)? but still able to create a client Node application) and write comments for frontend
 
 
@@ -44,8 +45,66 @@ python3 src/app.py            # http://localhost:8099
 
 Two different tokens are involved. The **index** token authorizes the vectorstore
 read; standalone it is asked for once and kept in `localStorage`, and inside core
-it comes from `CreateFabricToken`. A **content** token authorizes the media of one
-content object, and is only ever asked for standalone — see *Media*.
+it comes from `CreateSignedToken` for the index qid. A **content** token
+authorizes the media of one content object, and is only ever asked for
+standalone — see *Media*.
+
+### Querying a Qwen index needs extra packages
+
+Loading and plotting any index works with the base install. **Querying** a
+Qwen-stamped index additionally needs the tagger's own runtime, because the
+query is embedded by importing `model-qwenvl-video-vector`'s embedder rather
+than reimplementing it. Those packages are in `requirements.txt` under their own
+heading; without them the first query — not the load — fails with:
+
+```
+could not embed query: found the tagger at <path> but could not import its
+embedder: No module named 'qwen_vl_utils'. Its dependencies (qwen-vl-utils,
+decord, transformers>=4.57.3) have to be installed in this environment.
+```
+
+That is the intended message, not a bug: the embedder is resolved lazily, so the
+error names the path it found the tagger at and the exact module missing.
+**Nothing is installed automatically** — the service never shells out to pip, so
+this resurfaces in every fresh environment (a container, another checkout,
+another account) until `requirements.txt` is installed there. Inside the
+tagger's own container it never appears, since that image already carries them
+and `/elv` is the first path searched.
+
+`transformers>=4.57.3` in that message is a floor, not a pin — a newer major
+version is fine (verified on 5.12.1), so it rarely needs action.
+
+Two costs on the *first* Qwen query, neither repeated: the checkpoint downloads
+(`Qwen/Qwen3-VL-Embedding-8B` is **16.3 GB**) and then takes ~45 s to load. The
+model then stays resident.
+
+### GPU selection
+
+The tagger asks for a bare `torch.device("cuda")`, which means *the current
+device* — device 0 unless told otherwise. On a shared multi-GPU box that is
+reliably the busiest card, so the model would load into the least free memory
+while others sat idle, and a long video query would then OOM with several GiB
+free elsewhere.
+
+`_use_best_cuda_device()` sets the current device to whichever GPU has the most
+free memory before the tagger constructs its model, which redirects both its
+`torch.device("cuda")` and the `.to(device)` that follows — no argument the
+tagger does not have, and no edit to it. `mem_get_info` reports the driver's
+view, so memory held by *other* processes counts, which is what an allocation
+actually competes with.
+
+On an OOM the model is moved once to whichever card now has the most room and
+the embed is retried; the device is chosen at load, but a long-running service
+outlives that snapshot. It is deliberately **not** retried with fewer frames:
+`fps`/`max_frames` are the recipe's sampling budget, and a query sampled
+differently lands in a different space from the indexed vectors, so it would
+return quietly wrong neighbours instead of failing. If it still does not fit,
+the error says so in those terms and suggests a shorter clip.
+
+The heuristic is "most free memory", so a small card can win when it happens to
+be the emptiest — on a box with mixed GPUs a 16 GB card can be picked for a
+model that needs more, which surfaces as a load failure rather than a silent
+one.
 
 ## Layout
 
@@ -239,21 +298,60 @@ publishes — `hls-clear` or `hls-aes128` — not by name. This is the same chec
 EVIE makes when it marks offerings `disabled`. Frames are unfussy: every offering
 serves them, so those keep the name preference.
 
-**Two transports, one shape.** Inside core the FrameClient signs URLs against the
-viewer's account: `Rep(..., channelAuth: true)` for frames, `PlayoutOptions` for
-clips. Standalone there is no account, so the viewer pastes a token for the
-content object and URLs are built directly against a fabric node with
-`?authorization=`. The prompt appears once per content object, not once per node,
-and a rejected token is discarded rather than left stuck. Both paths choose the
-offering identically, and the token path is dormant whenever core is present.
+**One transport, two token sources.** Every URL is built the same way — straight
+at a fabric node with `?authorization=<token>` — and only the token's origin
+differs. Inside core it is minted on demand by `CreateSignedToken({objectId,
+grantType: "read"})` over the FrameClient, so nothing is asked of the viewer.
+Standalone the viewer pastes one, once per content object rather than once per
+node, and a rejected token is discarded rather than left stuck.
+
+**The token's scope is what decides access, not the transport.** This replaced a
+split where core used `Rep(..., channelAuth: true)` and `PlayoutOptions`
+instead. Those authorize against the *account*: `CreateFabricToken` mints
+`acspjc…` carrying only `adr`/`sub`/`spc` — no `qid`, no grant — and the fabric
+answers "no matching policy". `CreateSignedToken` mints `aessjc…` carrying
+`qid`/`lib`/`gra: read`, which is the shape that works; it resolves `libraryId`
+from `objectId` itself and is on FrameClient's allowlist. The same correction
+applies to the index load, which authorizes the *index* qid the same way.
+
+Collapsing the two paths also means **the code that runs in core is the code
+exercised standalone**, rather than a second implementation that only ran where
+it was hardest to test — which is why the core path stayed broken unnoticed.
+
+Minted tokens are cached per `qid` (24 h, re-minted a minute early), so clicking
+twenty nodes from one object costs one signature rather than twenty.
 
 `ignore_trimming=true` matters on the frame endpoint: without it the frame is
 addressed against the trimmed timeline, which is not the timeline the tagger
 recorded timestamps against. The HLS master manifest embeds the authorization
 into every child URI, so variant playlists and segments carry auth unaided.
 
-Clips are bounded client-side: playback seeks to `start_time` and pauses at
-`end_time` rather than running on into the next scene.
+**Read errors through `errorMessage`, never `err.message`.** `FrameClient`
+rejects with core's raw error object and, on timeout, with a bare string —
+neither has a `.message`, so reading it directly renders the string
+`"undefined"` in place of every real failure.
+
+### Clips play their own segment
+
+Playback seeks to `start_time` and pauses at `end_time` rather than running on
+into the next scene. A vector with `start == end == 0` has **no** out point and
+plays the whole video.
+
+That sentinel is deliberate on the tagger side, not an accident of empty fields.
+`model-qwenvl-video-vector` windows a video itself and stamps each window with
+its true bounds, collapsing them only when the whole video was embedded as one:
+
+```python
+st, et = (0, 0) if single_window else (start_ms, end_ms)
+```
+
+So a segment vector carries a real `start_time` *and* `end_time`, and the
+whole-video case is distinguishable from a segment that merely begins at zero.
+Both halves of the behaviour follow from that with no extra plumbing.
+
+It is also why modality must come from the recipe's `kind` rather than from
+which fields are populated: a whole-video tag has no `frame_idx` and `start ==
+end == 0`, which the field heuristic reads as `unknown`.
 
 ## Verified against the live vectorstore
 
@@ -291,10 +389,28 @@ to end in a browser:
   own 4.2 s duration), so a query clip needs neither the fabric nor a token.
 - `?authorization=` is accepted on every one of these endpoints, so the
   standalone path needs no core and no keys.
-- **Permissions are per-capability.** A token that reads `/meta/offerings` (200)
-  can still be refused the frame rep (403, `q.read.bccall`: "no matching
-  policy") — metadata read and bitcode call are separate grants, so an
-  account-level `CreateFabricToken` is not necessarily enough to see media.
+- **An account-scoped token is not enough, and fails unevenly.** One read
+  `/meta/offerings` (200) yet was refused the frame rep (403, `q.read.bccall`:
+  "no matching policy"), which reads like a per-capability grant but is the
+  token's scope: `CreateFabricToken` names no `qid`. Re-checked 2026-09-09 with
+  an object-scoped `aessjc…` token on the same object — `/meta/offerings` 200,
+  frame rep 200 (`image/jpeg`, 640×480, 40,776 B), and the `hls-clear` manifest
+  200 with the authorization embedded in all 37 child URIs.
+
+## Verified inside core
+
+Checked 2026-09-09 with the app loaded as a plug-in in a running elv-core-js:
+
+- The index loads with no token input — `CreateSignedToken` for the index qid.
+- Frame images and video play with no token input — the same call per content
+  qid. The standalone unlock form correctly never appears.
+- The vectorstore does not evaluate access itself: it forwards the token to the
+  fabric node holding the index and relays the verdict. So the status code says
+  *which* half failed — **400** (`unknown scheme`) is a malformed or absent
+  token, **403** is a well-formed one denied by policy. That reason lives only
+  in the response body, which `raise_for_status()` discards; `_check`/`_reason`
+  in `vectors_api.py` walk the fabric's nested `cause` chain to the innermost
+  `kind`/`op` so a 403 is not indistinguishable from a stopped service.
 
 ## Open items
 
@@ -303,11 +419,13 @@ to end in a browser:
   lives only in `model-vector` locally and the frame index predates it, so its
   rows carry no `additional_info`. Re-tag content and detection takes over on
   its own; until then every index falls back to the declared model.
-- **The Qwen path has never run.** `QwenQueryEmbedder` is wired, dispatched to
-  and unit-tested for construction and parameter threading, but no query has
-  been embedded through it — the Qwen index is empty, and the tagger's
-  dependencies (`qwen-vl-utils`, `decord`) are not installed here. It will load
-  the checkpoint on the first query against a Qwen index.
+- ~~**The Qwen path has never run.**~~ Closed 2026-09-09: text and image queries
+  both return results against `iq__8MzaWjtTDuWuyTjAazYWnQDwPew`
+  (`Qwen/Qwen3-VL-Embedding-8B`, 267 rows). The first query pays a **16.3 GB**
+  checkpoint download and then ~45 s to load 749 tensors; later queries reuse
+  the resident model. The tagger's runtime deps are now listed in
+  `requirements.txt` — they are *not* implied by installing the rest, so a fresh
+  environment fails with an import error until they are installed.
 - **One recipe per index.** A query has to be embedded with one model, so if an
   index mixes tracks from different taggers the first recipe wins. All of them
   are returned in `recipes` so a mismatch is at least visible.
@@ -324,10 +442,9 @@ to end in a browser:
   vector matrix and a fitted projector, so an uncapped cache walks the process
   out of memory over a session of reloads. There is no eviction notice: a client
   holding an evicted `index_key` gets "index not loaded" and must reload.
-- **The core path is the one piece never run for real.** Frames and clips are
-  verified against the live fabric through the standalone token path, and the
-  FrameClient calls are the same ones EVIE makes, but nothing here has yet run
-  inside a core iframe.
+- ~~**The core path is the one piece never run for real.**~~ Closed 2026-09-09:
+  index load, frame images and video playback all verified inside a core iframe,
+  with no token prompt. See "Verified inside core".
 - Video *queries* need an embedder that supports them (Qwen); SigLIP 2 does not.
   The clip branch of the detail panel is exercised, but only by forcing a frame
   row to video modality — modality colouring and a legend with more than one
@@ -349,9 +466,12 @@ Two additions on the core side, both on branch `embeddings-visualizer`:
   dark and a light core header above a dark iframe reads as a seam.
 
 The app itself talks to core through the vendored `FrameClient`
-(`web/vendor/`), asking for a signed token with `CreateFabricToken`. Note that
-`FrameClient` resolves with the response itself — destructuring `{response}` off
-it silently yields `undefined`.
+(`web/vendor/`), asking for object-scoped tokens with `CreateSignedToken` — for
+the index qid on load, and per content qid for media. Two things about that
+channel bite silently: `FrameClient` resolves with the response *itself*, so
+destructuring `{response}` off it yields `undefined`; and it *rejects* with
+core's raw error object or a bare string, so reading `.message` off a failure
+also yields `undefined`.
 
 deck.gl compares a layer's `data` by reference, so state that feeds a layer must
 be replaced, never mutated. Pushing onto the query array left the node layer

@@ -58,6 +58,66 @@ QWEN_PATH_CANDIDATES = (
 DEFAULT_VIDEO_SUFFIX = ".mp4"
 
 
+def _pick_cuda_device() -> Optional[int]:
+    """Index of the CUDA device with the most free memory, or None without CUDA.
+
+    The tagger asks for a bare `torch.device("cuda")`, which is *the current
+    device* -- device 0 unless something has set otherwise. On a shared
+    multi-GPU box device 0 is usually the busiest, so the model lands where
+    there is least room while other cards sit idle.
+
+    `mem_get_info` reports the driver's view, so memory held by other processes
+    counts -- which is the point, since that is what an allocation competes with.
+    """
+    import torch  # noqa: PLC0415
+
+    if not torch.cuda.is_available():
+        return None
+    best, most_free = None, -1
+    for i in range(torch.cuda.device_count()):
+        try:
+            free, _total = torch.cuda.mem_get_info(i)
+        except Exception:
+            continue   # a device that cannot be queried is not a candidate
+        if free > most_free:
+            best, most_free = i, free
+    return best
+
+
+def _use_best_cuda_device() -> Optional[int]:
+    """Point the *current* CUDA device at the emptiest GPU. Returns its index.
+
+    Set before the tagger constructs its model, this redirects both its
+    `torch.device("cuda")` and the `.to(device)` that follows, so the weights
+    load onto the chosen card without the tagger needing a device argument.
+    """
+    import torch  # noqa: PLC0415
+
+    device = _pick_cuda_device()
+    if device is not None:
+        torch.cuda.set_device(device)
+    return device
+
+
+def _is_oom(exc: BaseException) -> bool:
+    import torch  # noqa: PLC0415
+
+    return isinstance(exc, getattr(torch.cuda, "OutOfMemoryError", ())) or (
+        isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
+    )
+
+
+def _free_gib(device: Optional[int]) -> float:
+    import torch  # noqa: PLC0415
+
+    if device is None:
+        return 0.0
+    try:
+        return torch.cuda.mem_get_info(device)[0] / 1024 ** 3
+    except Exception:
+        return 0.0
+
+
 def _qwen_search_paths() -> List[str]:
     override = os.environ.get("QWEN_EMBEDDING_PATH")
     return ([override] if override else []) + list(QWEN_PATH_CANDIDATES)
@@ -137,11 +197,42 @@ class QwenQueryEmbedder:
                     kwargs[key] = value
             if self.instruction:
                 kwargs["default_instruction"] = self.instruction
+            # Before construction: the tagger resolves its device at __init__.
+            self.device = _use_best_cuda_device()
             try:
                 self._embedder = cls(**kwargs)
             except Exception as exc:
                 raise EmbeddingError(f"could not load {self.model_id}: {exc}") from exc
         return self._embedder
+
+    def _relocate(self) -> bool:
+        """Move an already-loaded model to whichever GPU now has the most room.
+
+        The device is chosen once, at load, but a long-running service outlives
+        that snapshot: another process can fill the card afterwards. On an OOM
+        this re-picks and moves, which is worth a try precisely because the
+        weights are the large, immovable part of the footprint.
+
+        Returns False when there is nowhere better to go, so the caller can
+        report the original error rather than retry the same allocation.
+        """
+        import torch  # noqa: PLC0415
+
+        if self._embedder is None or not torch.cuda.is_available():
+            return False
+        torch.cuda.empty_cache()   # fragmentation alone can be the whole problem
+        target = _pick_cuda_device()
+        if target is None or target == getattr(self, "device", None):
+            return False
+        try:
+            self._embedder.model.to(f"cuda:{target}")
+        except Exception:
+            return False
+        # Inputs follow model.device inside the tagger, so nothing else to move.
+        self.device = target
+        torch.cuda.set_device(target)
+        torch.cuda.empty_cache()
+        return True
 
     def embed_text(self, query: str) -> List[float]:
         if not (query or "").strip():
@@ -192,10 +283,53 @@ class QwenQueryEmbedder:
             item.setdefault("instruction", self.instruction)
         try:
             # process() returns (batch, dim); one item in, one row out.
-            embeddings = self.embedder.process([item], normalize=self.normalize)
+            embeddings = self._process_with_retry(item)
         except EmbeddingError:
             raise
         except Exception as exc:
             raise EmbeddingError(f"could not embed query: {exc}") from exc
         vector = embeddings[0].float().cpu().numpy().tolist()
         return pad_vector([float(x) for x in vector], self.target_size)
+
+    def _process_with_retry(self, item: Dict[str, Any]):
+        """Embed one item, moving to a roomier GPU once if the first try OOMs.
+
+        Deliberately *not* a retry with fewer frames. `fps`/`max_frames` are the
+        recipe's sampling budget, and a query sampled differently is not
+        comparable to the indexed vectors -- it would return neighbours quietly
+        computed in a different space, which is worse than failing. Only the
+        placement is retried, which changes nothing about the vector.
+        """
+        embedder = self.embedder   # resolves + loads on first use
+        try:
+            return embedder.process([item], normalize=self.normalize)
+        except Exception as exc:
+            if not _is_oom(exc):
+                raise
+            before = getattr(self, "device", None)
+            if not self._relocate():
+                raise EmbeddingError(self._oom_message(before, exc)) from exc
+            try:
+                return self.embedder.process([item], normalize=self.normalize)
+            except Exception as retry_exc:
+                if not _is_oom(retry_exc):
+                    raise
+                raise EmbeddingError(
+                    self._oom_message(getattr(self, "device", None), retry_exc)
+                ) from retry_exc
+
+    def _oom_message(self, device: Optional[int], exc: BaseException) -> str:
+        """Say what ran out and what the user can actually change.
+
+        The raw CUDA message is several lines of other processes' allocations,
+        which reads as a bug in this service rather than as a busy machine.
+        """
+        where = f"GPU {device}" if device is not None else "the GPU"
+        return (
+            f"not enough GPU memory to embed this query on {where} "
+            f"({_free_gib(device):.1f} GiB free). The clip's frames are the cost: "
+            "a longer video needs proportionally more, and the frame budget is "
+            "fixed by the index's recipe, so it cannot be lowered without putting "
+            "the query in a different space from the indexed vectors. Try a "
+            "shorter clip, or retry when the GPUs are less busy."
+        )
