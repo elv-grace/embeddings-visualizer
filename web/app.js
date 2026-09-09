@@ -19,6 +19,7 @@ import {
   needsToken,
   setContentToken,
   forgetContentToken,
+  errorMessage,
 } from "./media.js";
 
 const API = "";
@@ -96,13 +97,31 @@ function frameClient() {
   return state.client;
 }
 
-async function authToken() {
+/**
+ * A token authorizing reads of `objectId` (the index object).
+ *
+ * Object-scoped rather than a bare account token: the vectorstore does not
+ * check access itself, it forwards this to the fabric node holding the index
+ * and relays the verdict, and that check wants a token naming the qid it is
+ * being asked about. `CreateFabricToken` mints `acspjc…` — account and space
+ * only, no `qid`, no `gra` — which comes back "no matching policy". The
+ * `aessjc…` a signed token mints carries `qid`/`lib`/`gra: read` and is the
+ * shape that works. Self-signed, so it scopes the account's rights rather than
+ * granting any: if the account genuinely lacks read, this still fails.
+ */
+async function authToken(objectId) {
   const client = frameClient();
   if (client) {
     // Signed by core, which owns the keys. Note that FrameClient resolves with
     // the response itself — destructuring `{response}` off it silently yields
     // undefined.
-    return await client.CreateFabricToken({ duration: TOKEN_DURATION_MS });
+    // return await client.CreateFabricToken({ duration: TOKEN_DURATION_MS });
+    // libraryId is looked up from objectId by the client when omitted.
+    return await client.CreateSignedToken({
+      objectId,
+      grantType: "read",
+      duration: TOKEN_DURATION_MS,
+    });
   }
 
   let token = localStorage.getItem("ev_auth_token");
@@ -150,15 +169,26 @@ function metaRows(meta, { full = false } = {}) {
   if (meta.frame_idx !== null && meta.frame_idx !== undefined) push("frame", meta.frame_idx);
 
   // A frame is an instant, so its start and end are equal; collapse them into
-  // one row rather than showing the same number twice.
-  if (meta.start_time === meta.end_time) {
+  // one row rather than showing the same number twice. A tag-aligned segment
+  // also arrives with start == end, but is an interval — show the derived bound
+  // rather than reporting it as an instant.
+  if (meta.start_time === meta.end_time && !(meta.derived_end_time > meta.start_time)) {
     push("time", formatTime(meta.start_time));
   } else {
     push("start", formatTime(meta.start_time));
-    push("end", formatTime(meta.end_time));
+    push("end", meta.end_time > meta.start_time
+      ? formatTime(meta.end_time)
+      : `${formatTime(meta.derived_end_time)} (derived)`);
   }
   push("source", full ? meta.source : truncate(meta.source, 22));
   if (full) push("batch", meta.batch_id);
+  // Everything the tagger stamped, so the recipe is inspectable rather than
+  // having to be inferred from behaviour.
+  if (full && meta.additional_info && Object.keys(meta.additional_info).length) {
+    for (const [k, v] of Object.entries(meta.additional_info)) {
+      push(k, truncate(typeof v === "object" ? JSON.stringify(v) : String(v), 40));
+    }
+  }
   return rows;
 }
 
@@ -730,8 +760,22 @@ function wireUnlock(point) {
  * playing.
  */
 function clipRange(meta) {
-  if (!(meta.end_time > meta.start_time)) return "Whole video";
-  return `Clip ${formatTime(meta.start_time)} – ${formatTime(meta.end_time)}`;
+  const end = segmentEnd(meta);
+  if (end === null) return "Whole video";
+  const suffix = meta.end_time > meta.start_time ? "" : " (derived)";
+  return `Clip ${formatTime(meta.start_time)} – ${formatTime(end)}${suffix}`;
+}
+
+/** The out point to play to, or null to run to the end of the video.
+ *
+ * Prefers what the tagger recorded. `derived_end_time` is the reconstruction the
+ * service makes for tag-aligned rows, whose own end is the re-based
+ * start == end sentinel rather than a real bound — see `derive_segment_ends`.
+ */
+function segmentEnd(meta) {
+  if (meta.end_time > meta.start_time) return meta.end_time;
+  if (meta.derived_end_time > meta.start_time) return meta.derived_end_time;
+  return null;
 }
 
 /** Fetch the frame or the clip and swap it into the open panel. */
@@ -772,17 +816,22 @@ async function loadMedia(point) {
     const video = $("clip");
     const attach = () => {
       teardownMedia();
-      state.mediaTeardown = playClip(video, url, meta.start_time, meta.end_time);
+      // state.mediaTeardown = playClip(video, url, meta.start_time, meta.end_time);
+      state.mediaTeardown = playClip(video, url, meta.start_time, segmentEnd(meta));
     };
     $("clip-replay").addEventListener("click", attach);
     attach();
   } catch (err) {
     if (token !== state.mediaToken) return;
-    if (client) return mediaFailed(host, err.message);
+    // errorMessage, not err.message: FrameClient rejects with core's raw error
+    // object or a bare string, and reading .message off those renders
+    // "undefined" in place of the actual failure.
+    // if (client) return mediaFailed(host, err.message);
+    if (client) return mediaFailed(host, errorMessage(err));
     // A rejected token should not be sticky — drop it and ask for another,
     // rather than leaving the panel permanently broken for this object.
     forgetContentToken(meta.qid);
-    host.innerHTML = unlockForm(meta.qid, err.message);
+    host.innerHTML = unlockForm(meta.qid, errorMessage(err));
     wireUnlock(point);
   }
 }
@@ -909,7 +958,7 @@ async function loadIndex() {
   const qid = $("index-qid").value.trim();
   if (!qid) return alert("An index QID is required.");
 
-  const token = await authToken();
+  const token = await authToken(qid);
   if (!token) return alert("An auth token is required.");
 
   const modes = [...document.querySelectorAll("#modes input:checked")].map((i) => i.value);

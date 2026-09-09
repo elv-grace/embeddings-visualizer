@@ -33,6 +33,7 @@ is not a sample of the index.
 from __future__ import annotations
 
 import random
+from bisect import bisect_right
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import requests
@@ -62,6 +63,46 @@ def _headers(auth_token: str) -> Dict[str, str]:
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
+
+
+def _check(response: requests.Response, what: str) -> requests.Response:
+    """raise_for_status, but keeping the reason the vectorstore gave.
+
+    The vectorstore does not evaluate access itself -- it forwards the token to
+    the fabric node holding the index object and relays that verdict. So a 403
+    here means the token was well-formed and signed (a malformed one comes back
+    400 "unknown scheme") and the account was denied read on the index qid.
+    That distinction lives only in the response body, which raise_for_status
+    discards, leaving a bare "403 Client Error: Forbidden for url: ..." that
+    cannot be told apart from a wrong URL or a stopped service.
+    """
+    if response.ok:
+        return response
+    reason = _reason(response)
+    raise VectorStoreError(
+        f"{what} failed: {response.status_code} {response.reason}"
+        + (f" -- {reason}" if reason else "")
+    )
+
+
+def _reason(response: requests.Response) -> str:
+    """The innermost `kind`/`reason` the fabric reported, or the raw body."""
+    try:
+        node = response.json()
+    except ValueError:
+        return (response.text or "").strip()[:300]
+
+    # The fabric nests the real cause: {"error": {"cause": {"cause": {...}}}}.
+    parts: List[str] = []
+    seen = 0
+    while isinstance(node, dict) and seen < 12:
+        seen += 1
+        for key in ("kind", "reason", "op"):
+            value = node.get(key)
+            if isinstance(value, str) and value not in parts:
+                parts.append(value)
+        node = node.get("cause") or node.get("error") or None
+    return ", ".join(parts)[:300]
 
 
 def _search(
@@ -95,7 +136,8 @@ def _search(
         headers=_headers(auth_token),
         timeout=TIMEOUT_SECONDS,
     )
-    response.raise_for_status()
+    # response.raise_for_status()
+    _check(response, f"search of {index_qid}")
     return (response.json() or {}).get("results", [])
 
 
@@ -106,7 +148,8 @@ def get_index(index_qid: str, auth_token: str) -> Dict[str, Any]:
         headers=_headers(auth_token),
         timeout=TIMEOUT_SECONDS,
     )
-    response.raise_for_status()
+    # response.raise_for_status()
+    _check(response, f"read of index {index_qid}")
     return response.json() or {}
 
 
@@ -117,7 +160,8 @@ def get_track_counts(index_qid: str, auth_token: str) -> Dict[str, int]:
         headers=_headers(auth_token),
         timeout=TIMEOUT_SECONDS,
     )
-    response.raise_for_status()
+    # response.raise_for_status()
+    _check(response, f"track counts for {index_qid}")
     tracks = (response.json() or {}).get("tracks", [])
     return {t.get("name", "?"): t.get("count", 0) for t in tracks}
 
@@ -134,13 +178,21 @@ def count_windows(
     auth_token: str,
     probe: Sequence[float],
     sources: Optional[List[str]] = None,
-) -> List[Tuple[int, int, int]]:
+) -> Tuple[List[Tuple[int, int, int]], Dict[str, List[int]]]:
     """Partition the timeline into windows of at most WINDOW_LIMIT rows.
 
-    Returns (start_time_gte, start_time_lte, row_count) per non-empty window.
-    Runs without vectors, so the whole index costs ~150 B/row to walk.
+    Returns (start_time_gte, start_time_lte, row_count) per non-empty window,
+    plus every row's start_time grouped by content qid. Runs without vectors, so
+    the whole index costs ~150 B/row to walk.
+
+    The start times are collected here, and not later, because this pass sees the
+    whole index while the fetch that follows sees only the sample. Deriving
+    shot bounds from the sample would stretch a shot across whatever its
+    neighbours' rows the sampling happened to drop; deriving them here means a
+    sampled row still carries the bound it has in the full index.
     """
     windows: List[Tuple[int, int, int]] = []
+    starts_by_qid: Dict[str, List[int]] = {}
     # Explicit stack rather than recursion: the bisection can go ~40 deep.
     pending = [(0, MAX_START_TIME_MS)]
 
@@ -168,8 +220,70 @@ def count_windows(
             print(f"warning: window [{lo}, {hi}] is saturated, rows beyond {WINDOW_LIMIT} are invisible")
         windows.append((lo, hi, len(rows)))
 
+        for row in rows:
+            entry = row.get("vector") or {}
+            # Frames and text are instants, not segments; including them would
+            # invent an interval for a row that never had one.
+            if entry.get("frame_idx") is not None or (entry.get("text") or "").strip():
+                continue
+            start = entry.get("start_time")
+            if start is None:
+                continue
+            starts_by_qid.setdefault(entry.get("qid") or "", []).append(int(start))
+
     windows.sort()
-    return windows
+    for starts in starts_by_qid.values():
+        starts.sort()
+    return windows, starts_by_qid
+
+
+def derive_segment_ends(
+    metadata: List[Dict[str, Any]], starts_by_qid: Dict[str, List[int]]
+) -> int:
+    """Fill in `derived_end_time` for segment rows whose own end is unusable.
+
+    Why the end is missing
+    ----------------------
+    A tag-aligned tagger is handed one segment at a time as its whole input, so
+    within that clip it sees a single window and stamps the "whole of this media"
+    sentinel start == end == 0. The pipeline then re-bases the row into the parent
+    timeline, shifting both fields by the segment's offset and leaving
+    start == end == segment start -- a row that reads as "whole video" and plays
+    to the end of the file instead of stopping at its own segment.
+
+    Model-side windowing never lands here: a tagger that splits by
+    `segment_length_s` sees several windows and stamps real bounds, so `end_time`
+    is already right and nothing below fires.
+
+    What is assumed
+    ---------------
+    Segments tile the timeline contiguously and do not overlap --
+    true of shot alignment and of fixed-length clip alignment alike, which is why
+    this keys off neighbouring starts rather than anything shot-specific. The next
+    segment's start is this segment's end, so for tiling input this
+    reconstructs the alignment track's bounds rather than approximating them.
+
+    The last segment of each object has no successor and is left open, which
+    plays it to the end of the video -- right for a final segment.
+
+    Written to `derived_end_time`, never over `end_time`: the row keeps saying
+    what the tagger actually recorded, so a reconstructed bound can be labelled
+    as reconstructed.
+    """
+    filled = 0
+    for meta in metadata:
+        start, end = meta.get("start_time"), meta.get("end_time")
+        if start is None or (end is not None and end > start):
+            continue   # a real interval; nothing to derive
+        if meta.get("frame_idx") is not None or (meta.get("text") or "").strip():
+            continue
+        starts = starts_by_qid.get(meta.get("qid") or "") or []
+        nxt = bisect_right(starts, int(start))
+        if nxt >= len(starts):
+            continue   # last segment of this object: leave open
+        meta["derived_end_time"] = starts[nxt]
+        filled += 1
+    return filled
 
 
 def _quotas(counts: Sequence[int], sample_size: int) -> List[int]:
@@ -214,7 +328,12 @@ def get_vectors(
         print(f"Tracks: {track_counts} (total {sum(track_counts.values())})")
 
     print("Counting rows per window (no vectors)...")
-    windows = count_windows(index_qid, auth_token, _random_probe(vector_size, rng), sources)
+    # windows = count_windows(index_qid, auth_token, _random_probe(vector_size, rng), sources)
+    # Also returns every row's start_time, which is what segment ends are derived
+    # from -- collected here because this pass sees the whole index, not the sample.
+    windows, starts_by_qid = count_windows(
+        index_qid, auth_token, _random_probe(vector_size, rng), sources
+    )
     population = sum(count for _, _, count in windows)
     if population == 0:
         return [], []
@@ -247,6 +366,10 @@ def get_vectors(
             metadata.append(entry)
 
     print(f"Retrieved {len(vectors)} of {population} vectors from index `{index_qid}`")
+
+    filled = derive_segment_ends(metadata, starts_by_qid)
+    if filled:
+        print(f"Derived an end time for {filled} segment rows that carried none")
     return vectors, metadata
 
 
