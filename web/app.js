@@ -809,9 +809,7 @@ function mediaSkeleton(point) {
     return `<p class="quote">${escapeHtml(meta.text || "")}</p>`;
   }
   if (point.modality === "unknown") {
-    return `<div class="placeholder">
-      No recognisable media fields.<br><small>Showing metadata only.</small>
-    </div>`;
+    return `<div class="placeholder">${unknownReason(meta)}</div>`;
   }
   if (needsToken(frameClient(), meta.qid)) {
     // Standalone there is no account to authorize against, so the viewer
@@ -857,6 +855,34 @@ function wireUnlock(point) {
   $("content-token-go").addEventListener("click", submit);
   input.addEventListener("keydown", (e) => e.key === "Enter" && submit());
   input.focus();
+}
+
+/** Why a row could not be classified, in terms of the field that is wrong.
+ *
+ * "No recognisable media fields" was true but unhelpful: by far the most common
+ * cause is a time range that is not a range, and saying so points at the tagger
+ * rather than leaving the vector looking merely unsupported.
+ */
+function unknownReason(meta) {
+  const hasStart = meta.start_time !== null && meta.start_time !== undefined;
+  const hasEnd = meta.end_time !== null && meta.end_time !== undefined;
+
+  if (hasStart && !hasEnd) {
+    return `This vector has a <b>start_time</b> but no <b>end_time</b>, so there
+      is no clip to play.<br><small>The tagger did not record an extent for it.
+      Showing metadata only.</small>`;
+  }
+  if (hasStart && hasEnd && meta.end_time <= meta.start_time) {
+    const same = meta.end_time === meta.start_time;
+    return `This vector's <b>end_time</b> ${same ? "equals" : "precedes"} its
+      <b>start_time</b> (${formatTime(meta.start_time)}), so it describes no
+      extent.<br><small>Whole-media tags once carried
+      <code>start == end == 0</code> as a sentinel; a segment that reaches here
+      was written before that was fixed and has no sibling segments to derive an
+      end from. Showing metadata only.</small>`;
+  }
+  return `No recognisable media fields.<br><small>No text, no frame index and no
+    time range, so there is nothing to fetch. Showing metadata only.</small>`;
 }
 
 /** The detection box a crop vector was embedded from, or null.

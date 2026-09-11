@@ -55,6 +55,48 @@ uv pip install --python "$PY" \
   "loguru" \
   --extra-index-url https://download.pytorch.org/whl/cpu
 
+# The tagger's source, if it is not already beside this repo.
+#
+# Fetched rather than vendored. Three pieces are needed and only two of them are
+# packaged: common-ml and celeb_vector have setup.py, but `celeb` (which holds
+# FaceModel, the InsightFace wrapper) has none -- model-celeb has no setup.py at
+# its root, which is why its own Containerfile COPYs the directory. So a clone is
+# what actually supplies all three.
+#
+# Copying those files into this repo would work and is deliberately not done: a
+# query has to produce the same vector the tagger produced, and a copy that
+# drifts does not fail, it returns wrong neighbours. A clone stays versioned and
+# updatable.
+#
+# Both repos are private (git@github.com:eluv-io/...), so this needs an SSH key
+# with access -- the same requirement the tagger's own Containerfile has.
+SRC_DIR="$ENV_DIR/src"
+clone_if_missing() {
+  local name="$1" url="$2" probe="$3"
+  if [ -e "$probe" ]; then
+    echo "    $name: already present at $probe"
+    return
+  fi
+  if [ -d "$SRC_DIR/$name" ]; then
+    echo "    $name: already cloned into $SRC_DIR/$name"
+    return
+  fi
+  echo "    $name: not found locally, cloning"
+  mkdir -p "$SRC_DIR"
+  if ! git clone --depth 1 "$url" "$SRC_DIR/$name" 2>&1 | sed 's/^/      /'; then
+    echo "      could not clone $url -- it is private, so this needs an SSH key" >&2
+    echo "      with access. Or place the checkout beside this repo and re-run." >&2
+    return 1
+  fi
+}
+
+echo "==> locating the tagger's source"
+REPO_PARENT="$(dirname "$REPO")"
+clone_if_missing "model-celeb" "git@github.com:eluv-io/model-celeb.git" \
+  "$REPO_PARENT/model-celeb/model-celeb-vector/celeb_vector/model.py" || true
+clone_if_missing "common-ml" "git@github.com:eluv-io/common-ml.git" \
+  "$REPO_PARENT/common-ml/common_ml" || true
+
 echo "==> verifying"
 "$PY" - <<'PY'
 import sys

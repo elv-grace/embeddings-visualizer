@@ -65,9 +65,15 @@ logger = logging.getLogger(__name__)
 CELEB_VENV_PYTHON = Path(__file__).resolve().parents[1] / ".celebenv" / "bin" / "python"
 CELEB_WORKER = Path(__file__).resolve().parents[1] / "tools" / "celeb_worker.py"
 
+# Where tools/setup_celeb_env.sh clones the tagger's source when there is no
+# checkout beside this repo -- see that script for why it fetches rather than
+# vendors the files.
+_CLONED = Path(__file__).resolve().parents[1] / ".celebenv" / "src"
+
 COMMON_ML_CANDIDATES = (
     "/elv",
     str(Path(__file__).resolve().parents[2] / "common-ml"),
+    str(_CLONED / "common-ml"),
 )
 
 
@@ -87,11 +93,13 @@ MODEL_ID = "insightface-r100-ii"
 NATIVE_DIM = 512
 
 # Searched in order, after a plain import has already been tried.
-#   /elv   the tagger container's WORKDIR
-#   ../..  a sibling checkout, for a plain local layout
+#   /elv            the tagger container's WORKDIR
+#   ../..           a sibling checkout, for a plain local layout
+#   .celebenv/src   a clone the setup script made, when there was no checkout
 CELEB_PATH_CANDIDATES = (
     "/elv",
     str(Path(__file__).resolve().parents[2] / "model-celeb" / "model-celeb-vector"),
+    str(_CLONED / "model-celeb" / "model-celeb-vector"),
 )
 
 # Where the InsightFace r100 weights live. config.yml names /ml/models/celeb_detection
