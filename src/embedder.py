@@ -1,43 +1,36 @@
-"""SigLIP 2 image and text towers, for embedding a search query into an index.
+"""Which embedding model an index was built with, and the tower that matches it.
 
-Self-contained copy
--------------------
-This mirrors content-search's ``content_search/frame_search/embedder.py``, which
-itself mirrors the tagger's ``FeatureExtractor`` in
-model-vector/model-siglip2-frame-vector. Keeping the visualizer independent of a
-running content-search costs a third copy of the same contract, and all three
-have to agree or query vectors land in a different space than the indexed ones.
+How the model is determined
+---------------------------
+From the **batch** a vector was written in, not from anything the vector itself
+carries. Each row names its `batch_id`; `GET /indexes/{qid}/batches/{batch_id}`
+returns that batch's `model`, and the mapping from model to embedder is 1-1
+because a batch is one tagger run and a tagger has exactly one embedder.
 
-TODO: collapse these into one shared package. The values below are load-bearing
-and silent when wrong -- a mismatch does not raise, it just returns bad
-neighbours. In particular the text tower's padding="max_length"/max_length=64 is
-the fixed-length padding SigLIP was trained on; tokenized any other way, the
-query vector moves far enough that results collapse onto whatever content
-dominates the index.
+This replaced reading the model out of each vector's `additional_info`. A batch
+is the right place for it: the field cannot go missing the way a stamped one can
+(taggers have already stopped stamping `kind`), it is authoritative for every
+row in the run rather than per-row, and it costs one lookup per batch instead of
+trusting whatever the first row happened to carry.
 
-The index does not record which model produced it. GET /indexes/{qid} returns
-only {qid, vector_size}, and the per-vector metadata carries no model fields, so
-these constants cannot be read back from the index and are supplied by the
-caller instead.
+`query_modes` lives here for the same reason -- which kinds of query a space
+accepts is a property of the model, not something a vector should have to say.
+
+The towers themselves are in `siglip2_embedder` and `qwen_embedder`; this module
+only decides between them. Both are imported lazily, inside `build_embedder_for_model`,
+so the weights load only for a query and so the tower modules can import the
+shared helpers below without a cycle.
 """
 
 from __future__ import annotations
 
-import os
-import sys
-from pathlib import Path
-from typing import IO, Dict, List, Optional, Sequence
+from typing import IO, Any, Dict, List, Optional
 
 import numpy as np
-import torch
-import torch.nn.functional as F
 from PIL import Image, ImageOps
 
-# Must match what the index was tagged with; see the module docstring.
-DEFAULT_MODEL_ID = "google/siglip2-base-patch16-naflex"
-DEFAULT_REVISION = "b53b807d3a2d5e2b3911292f2d69e5341cdc064c"
-DEFAULT_NORMALIZE = True
-DEFAULT_MAX_NUM_PATCHES = 256
+# Width the visualizer pads query vectors to when an index is wider than the
+# model; see pad_vector.
 DEFAULT_TARGET_SIZE = 1024
 
 
@@ -45,236 +38,95 @@ class EmbeddingError(RuntimeError):
     """A query could not be embedded."""
 
 
-def _resolve_device_dtype(dtype: Optional[torch.dtype]):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if dtype is not None:
-        return device, dtype
-    if device.type == "cuda":
-        # bf16 needs Ampere+; fall back to fp16 otherwise.
-        return device, torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    return device, torch.float32  # half precision is unstable/slow on CPU
+# An index's `model` -> the tower that embeds into that space, and the query
+# kinds it accepts. Adding a tagger means adding one entry here.
+INDEX_MODELS: Dict[str, Dict[str, Any]] = {
+    "frame_vectors": {"tower": "siglip2_embedder", "query_modes": ["text", "image"]},
+    "video_vectors": {"tower": "qwen_embedder", "query_modes": ["text", "image", "video"]},
+    # Face embeddings from model-celeb-vector. `image` only, and deliberately:
+    # these are InsightFace identity vectors, so there is no text tower that
+    # could put a description into the same space.
+    "face_vectors": {"tower": "celeb_embedder", "query_modes": ["image"]},
+}
 
 
-SIGLIP_PATH_CANDIDATES = (
-    "/elv",
-    str(Path(__file__).resolve().parents[2] / "model-vector" / "model-siglip2-frame-vector"),
+# Keys a tagger may stamp in `additional_info` that change the vector a query
+# must be embedded into. A whitelist, so the provenance a tagger also stamps
+# (box, score, upscale, crop_padding, detector, text) never reaches a tower.
+#
+# These TUNE a tower; they never choose one. The model comes from the batch --
+# see this module's docstring -- and nothing here can override it.
+TUNING_KEYS = (
+    "normalize",        # both: whether cosine reduces to a dot product
+    "max_num_patches",  # SigLIP 2: the NaFlex patch budget
+    "prompt",           # Qwen: the instruction the vectors were embedded under
+    "fps",              # Qwen: video sampling rate
+    "max_frames",       # Qwen: video frame budget
+    "max_length",       # Qwen: token budget
+    "dim",              # Qwen: the MRL width vectors were truncated to
+    "det_confidence",   # celeb: the MTCNN gate deciding which faces were kept
+    "min_box_size",     # celeb: the smallest face the tagger embedded
 )
 
 
-def _load_tagger_extractor():
-    """The tagger's own `FeatureExtractor`, or None if it is not importable.
+def read_tuning(metadata: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Tuning parameters stamped on the rows, or {} when nothing stamped any.
 
-    Same resolution order as `qwen_embedder`: plain import (inside the tagger's
-    container `/elv` is WORKDIR and already on `sys.path`), then
-    `SIGLIP_EMBEDDING_PATH`, then a sibling checkout.
+    A query embedded under different parameters than the index lands in a
+    different space and quietly returns the wrong neighbours, so these are worth
+    reading when present. They are *optional*: every one has a default in the
+    tower that owns it, and an index that stamps nothing still queries correctly.
+
+    The first row carrying any of them wins. Parameters are invariant across a
+    tagger's run, so scanning further would only cost time; where an index mixes
+    taggers its batches differ too, which `models` already surfaces.
     """
-    paths = [os.environ["SIGLIP_EMBEDDING_PATH"]] if os.environ.get("SIGLIP_EMBEDDING_PATH") else []
-    paths += list(SIGLIP_PATH_CANDIDATES)
-    for path in [None] + paths:
-        if path is not None:
-            if not Path(path, "siglip_frame", "model.py").is_file():
-                continue
-            if path not in sys.path:
-                sys.path.insert(0, path)
-        try:
-            from siglip_frame.config import RuntimeConfig
-            from siglip_frame.model import FeatureExtractor
-
-            return FeatureExtractor, RuntimeConfig
-        except ImportError:
+    for row in metadata:
+        info = row.get("additional_info")
+        if not isinstance(info, dict):
             continue
-    return None
+        found = {k: info[k] for k in TUNING_KEYS if info.get(k) is not None}
+        if found:
+            return found
+    return {}
 
 
-class Siglip2ImageEmbedder:
-    """Embeds an image query with the tagger's own vision tower.
-
-    The image half is where a mismatch is both silent and fatal — preprocessing
-    budget, pooling and normalize all move the vector — so it runs the tagger's
-    `FeatureExtractor` rather than a parallel implementation of it. The local
-    tower below is the fallback for when the tagger is not importable, and is
-    kept byte-for-byte equivalent.
-
-    The text half has no counterpart to import: this tagger only ever loads the
-    vision tower, so `Siglip2TextEmbedder` is necessarily query-side code.
-    """
-
-    def __init__(
-        self,
-        model_id: str = DEFAULT_MODEL_ID,
-        normalize: bool = DEFAULT_NORMALIZE,
-        max_num_patches: int = DEFAULT_MAX_NUM_PATCHES,
-        revision: Optional[str] = DEFAULT_REVISION,
-        dtype: Optional[torch.dtype] = None,
-    ) -> None:
-        if max_num_patches < 1:
-            raise EmbeddingError(f"max_num_patches must be >= 1, got {max_num_patches!r}")
-        self.normalize = normalize
-        self.max_num_patches = max_num_patches
-        self.device, self.dtype = _resolve_device_dtype(dtype)
-
-        tagger = _load_tagger_extractor()
-        if tagger is not None:
-            FeatureExtractor, RuntimeConfig = tagger
-            cfg = RuntimeConfig(normalize=normalize, max_num_patches=max_num_patches)
-            self._extractor = FeatureExtractor(
-                cfg, model_id=model_id, revision=revision, dtype=dtype
-            )
-            self.processor = self._extractor.processor
-            self.model = self._extractor.model
-            return
-
-        from transformers import Siglip2ImageProcessor, Siglip2VisionModel
-
-        self._extractor = None
-        # Vision tower only; transformers logs the checkpoint's text-tower keys as
-        # UNEXPECTED, which is the discarded half and is expected.
-        self.processor = Siglip2ImageProcessor.from_pretrained(model_id, revision=revision)
-        self.model = Siglip2VisionModel.from_pretrained(
-            model_id, revision=revision, dtype=self.dtype
-        ).to(self.device)
-        self.model.eval()
-
-    def embed_image(self, img: np.ndarray) -> np.ndarray:
-        if self._extractor is not None:
-            return self._extractor._embed_frame(img)
-
-        inputs = self._preprocess(img)
-        with torch.no_grad():
-            # .float() before normalizing: dividing in bf16 lands ~0.1% off unit
-            # length, which a cosine index reads as a real score difference.
-            vector = self.model(**inputs).pooler_output.float()
-            if self.normalize:
-                vector = F.normalize(vector, p=2, dim=-1)
-        return vector.squeeze(0).cpu().numpy()
-
-    def _preprocess(self, img: np.ndarray) -> Dict[str, torch.Tensor]:
-        """Turn an (H, W, 3) uint8 RGB image into the NaFlex vision-tower inputs."""
-        inputs = self.processor(
-            images=Image.fromarray(img),
-            return_tensors="pt",
-            max_num_patches=self.max_num_patches,
-        )
-        out = {k: v.to(self.device) for k, v in inputs.items()}
-        # Only pixel_values is float; the mask and spatial shapes stay integer.
-        out["pixel_values"] = out["pixel_values"].to(self.dtype)
-        return out
+def model_spec(model: Optional[str]) -> Optional[Dict[str, Any]]:
+    """The registry entry for an index's `model`, or None if it is unregistered."""
+    return INDEX_MODELS.get((model or "").strip())
 
 
-class Siglip2TextEmbedder:
-    """Embeds a text query into the same space as the frame vectors."""
-
-    def __init__(
-        self,
-        model_id: str = DEFAULT_MODEL_ID,
-        normalize: bool = DEFAULT_NORMALIZE,
-        revision: Optional[str] = DEFAULT_REVISION,
-        dtype: Optional[torch.dtype] = None,
-    ) -> None:
-        from transformers import Siglip2Processor, Siglip2TextModel
-
-        self.normalize = normalize
-        self.device, self.dtype = _resolve_device_dtype(dtype)
-
-        # Siglip2Processor rather than a bare tokenizer, for its text defaults:
-        # padding="max_length", truncation=True, max_length=64.
-        self.processor = Siglip2Processor.from_pretrained(model_id, revision=revision)
-        self.model = Siglip2TextModel.from_pretrained(
-            model_id, revision=revision, dtype=self.dtype
-        ).to(self.device)
-        self.model.eval()
-
-    def embed_text(self, query: str) -> np.ndarray:
-        inputs = self.processor(text=[query], return_tensors="pt")
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        with torch.no_grad():
-            vector = self.model(**inputs).pooler_output.float()
-            if self.normalize:
-                vector = F.normalize(vector, p=2, dim=-1)
-        return vector.squeeze(0).cpu().numpy()
+def query_modes_for(model: Optional[str]) -> List[str]:
+    """Which query kinds this model's space accepts; empty when unregistered."""
+    spec = model_spec(model)
+    return list(spec["query_modes"]) if spec else []
 
 
-class QueryEmbedder:
-    """Both towers behind one interface, loaded lazily.
+def build_embedder_for_model(
+    model: Optional[str], target_size: int, params: Optional[Dict[str, Any]] = None
+):
+    """The query embedder for an index whose batches report `model`.
 
-    Lazy because the weights are several GB and the projection half of the
-    service is useful without them: an index loads and plots with no model
-    resident, and only a search pays the load.
-    """
+    `params` only tunes an already-chosen tower (patch budget, sampling budget,
+    MRL width) and never selects one, so an index that stamped no parameters
+    still queries correctly on the tagger's own defaults.
 
-    def __init__(
-        self,
-        model_id: str = DEFAULT_MODEL_ID,
-        revision: Optional[str] = DEFAULT_REVISION,
-        normalize: bool = DEFAULT_NORMALIZE,
-        max_num_patches: int = DEFAULT_MAX_NUM_PATCHES,
-        target_size: int = DEFAULT_TARGET_SIZE,
-    ) -> None:
-        self.model_id = model_id
-        self.revision = revision
-        self.normalize = normalize
-        self.max_num_patches = max_num_patches
-        self.target_size = target_size
-        self._image: Optional[Siglip2ImageEmbedder] = None
-        self._text: Optional[Siglip2TextEmbedder] = None
-
-    def embed_text(self, query: str) -> List[float]:
-        if not (query or "").strip():
-            raise EmbeddingError("text query is empty")
-        if self._text is None:
-            self._text = Siglip2TextEmbedder(self.model_id, self.normalize, self.revision)
-        return self._to_index_width(self._text.embed_text(query))
-
-    def embed_image(self, image: IO[bytes]) -> List[float]:
-        if self._image is None:
-            self._image = Siglip2ImageEmbedder(
-                self.model_id, self.normalize, self.max_num_patches, self.revision
-            )
-        return self._to_index_width(self._image.embed_image(decode_image(image)))
-
-    def _to_index_width(self, vector: Sequence[float]) -> List[float]:
-        return pad_vector([float(x) for x in vector], self.target_size)
-
-
-def build_embedder(recipe, target_size: int) -> QueryEmbedder:
-    """Pick and configure a query embedder from a tagger's stamped recipe.
-
-    Dispatch is on the checkpoint id rather than a `kind`, because what a query
-    has to be embedded *with* is the model, not what the indexed vectors are.
-    Every recipe parameter that changes a vector is threaded through, so a query
-    is embedded under the same recipe the index was built with.
-
-    An unrecognised embedder raises rather than falling back to SigLIP 2: a
+    An unregistered model raises rather than defaulting to one of the towers: a
     wrong-model query does not fail, it silently returns meaningless neighbours.
     """
-    embedder = (recipe.embedder or "").lower()
-
-    if "siglip" in embedder:
-        return QueryEmbedder(
-            model_id=recipe.embedder,
-            revision=recipe.revision,
-            normalize=recipe.normalize,
-            max_num_patches=int(recipe.params.get("max_num_patches", DEFAULT_MAX_NUM_PATCHES)),
-            target_size=target_size,
+    spec = model_spec(model)
+    if spec is None:
+        raise EmbeddingError(
+            f"no query embedder is registered for index model {model!r}; "
+            f"known models are {sorted(INDEX_MODELS)}. Add one to INDEX_MODELS "
+            "rather than querying with a different model."
         )
+    # Imported here, not at module scope: the tower modules import the helpers
+    # below, and the weights should load only when a query needs them.
+    import importlib
 
-    if "qwen" in embedder:
-        # Imported here: qwen_embedder imports back for pad_vector/EmbeddingError.
-        from qwen_embedder import QwenQueryEmbedder
-
-        return QwenQueryEmbedder(
-            model_id=recipe.embedder,
-            revision=recipe.revision,
-            normalize=recipe.normalize,
-            target_size=target_size,
-            # dim is the MRL width; the rest of the sampling budget rides in params.
-            params={**recipe.params, "dim": recipe.dim},
-        )
-
-    raise EmbeddingError(
-        f"no query embedder is registered for {recipe.embedder!r}; "
-        "add one rather than querying with a different model"
-    )
+    tower = importlib.import_module(spec["tower"])
+    return tower.build(target_size, params)
 
 
 def pad_vector(vec: List[float], target_size: int) -> List[float]:

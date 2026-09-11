@@ -333,3 +333,27 @@ class QwenQueryEmbedder:
             "the query in a different space from the indexed vectors. Try a "
             "shorter clip, or retry when the GPUs are less busy."
         )
+
+
+MODEL_ID = "Qwen/Qwen3-VL-Embedding-8B"
+
+# The checkpoint config.yml names carries no revision, so the hub default branch
+# is used rather than a pin.
+MODEL_REVISION = None
+
+
+def build(target_size: int, params: Optional[Dict[str, Any]] = None) -> "QwenQueryEmbedder":
+    """The Qwen query embedder, configured for one index.
+
+    `params` only tunes an already-chosen tower -- `prompt` (the instruction the
+    indexed vectors were embedded under), `fps`/`max_frames` (a video query's
+    sampling budget) and `dim` (the MRL width). Anything absent falls through to
+    the tagger's own defaults, so an index that stamped nothing still queries.
+    """
+    return QwenQueryEmbedder(
+        model_id=MODEL_ID,
+        revision=MODEL_REVISION,
+        normalize=bool((params or {}).get("normalize", True)),
+        target_size=target_size,
+        params=dict(params or {}),
+    )

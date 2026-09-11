@@ -26,9 +26,11 @@ const API = "";
 
 /* Mirrors the modality colours in style.css — change both together. */
 const MODALITY = {
-  text:    { label: "Text",    css: "--m-text",    rgb: [ 63, 208, 201] },
+  // Mirrors style.css --m-*; see the CVD audit in the comment there.
+  // text was [63, 208, 201]; video was [255, 111, 181] (pre-CVD-audit)
+  text:    { label: "Text",    css: "--m-text",    rgb: [158, 250, 227] },
   image:   { label: "Image",   css: "--m-image",   rgb: [155, 125, 255] },
-  video:   { label: "Video",   css: "--m-video",   rgb: [255, 111, 181] },
+  video:   { label: "Video",   css: "--m-video",   rgb: [239,  90, 107] },
   unknown: { label: "Unknown", css: "--m-unknown", rgb: [107, 104, 128] },
 };
 /** A query node's colour: its modality's hue, lightened.
@@ -186,6 +188,12 @@ function metaRows(meta, { full = false } = {}) {
   // having to be inferred from behaviour.
   if (full && meta.additional_info && Object.keys(meta.additional_info).length) {
     for (const [k, v] of Object.entries(meta.additional_info)) {
+      // A box reads as four numbers, not as JSON punctuation.
+      if (k === "box" && v && typeof v === "object") {
+        const n = (x) => (Number.isFinite(Number(x)) ? Number(x).toFixed(3) : "?");
+        push("box", `${n(v.x1)}, ${n(v.y1)} → ${n(v.x2)}, ${n(v.y2)}`);
+        continue;
+      }
       push(k, truncate(typeof v === "object" ? JSON.stringify(v) : String(v), 40));
     }
   }
@@ -314,6 +322,9 @@ function buildLayers() {
           from: [q.x, q.y],
           to: [row.p.x, row.p.y],
           color: [...rgb, Math.round((70 + 185 * k) * q.alpha)],
+          // Carried so a click on the link can open the node it points at.
+          point: row.p,
+          pinned: q.pinned,
         });
       }
     }
@@ -330,6 +341,42 @@ function buildLayers() {
           pickable: false,
         })
       );
+
+      // A second, invisible copy of the pinned links, fat enough to hit.
+      //
+      // The link is often easier to aim at than the node it ends on — a
+      // neighbour in a dense cluster is a 3px dot among hundreds, while its
+      // link has the whole run from the query to grab. deck.gl's picking pass
+      // encodes indices rather than colours, so alpha 0 still picks; the
+      // visible layer keeps its 1.5px line and this one carries the hit area.
+      //
+      // Pinned only: during the few seconds a link flashes after a search, a
+      // fat invisible target over the map would swallow clicks meant for nodes.
+      const pinnedLinks = links.filter((d) => d.pinned);
+      if (pinnedLinks.length) {
+        layers.push(
+          new LineLayer({
+            id: "query-links-hit",
+            data: pinnedLinks,
+            getSourcePosition: (d) => d.from,
+            getTargetPosition: (d) => d.to,
+            getColor: [0, 0, 0, 0],
+            getWidth: 12,
+            widthUnits: "pixels",
+            pickable: true,
+            onHover: (info) => {
+              // Same feedback as hovering the node itself, so it is obvious
+              // which end of the link you are about to open.
+              const next = info.object ? info.object.point : null;
+              if (next !== state.hovered) {
+                state.hovered = next;
+                render();
+              }
+            },
+            onClick: (info) => (info.object ? select(info.object.point) : null),
+          })
+        );
+      }
     }
 
     layers.push(
@@ -635,15 +682,75 @@ function selectQuery(q) {
       ["neighbours", q.neighbours?.length ?? 0],
       ["best cos", best ? best.similarity.toFixed(3) : "—"],
     ])}
+    <div class="section">Nearest neighbours</div>
+    ${neighbourList(q)}
     <button id="query-pin" class="wide">${q.pinned ? "Unpin links" : "Pin links"}</button>`;
   $("detail").hidden = false;
   drawLegend();
   render();
 
+  wireNeighbourList(q);
   $("query-pin").addEventListener("click", () => {
     togglePin(q);
     $("query-pin").textContent = q.pinned ? "Unpin links" : "Pin links";
   });
+}
+
+/** The ranked neighbours, as rows you can hover and click.
+ *
+ * The map answers "where are they"; this answers "which are they", which the
+ * map cannot when a neighbour sits inside a dense cluster. Ranked by cosine in
+ * the original space — the same ranking the links draw, and the only ranking
+ * that means anything, since 2D distance is layout.
+ */
+function neighbourList(q) {
+  const rows = (q.neighbours || [])
+    .map((n) => ({ n, p: state.points[n.index] }))
+    .filter((d) => d.p);
+  if (!rows.length) return `<p class="hint">No neighbours were returned.</p>`;
+
+  return `<ol class="neighbours">${rows
+    .map(({ n, p }, rank) => {
+      const rgb = (MODALITY[p.modality] || MODALITY.unknown).rgb;
+      return `<li data-i="${p.i}">
+        <span class="rank">${rank + 1}</span>
+        <span class="dot" style="background:${rgbCss(rgb)}"></span>
+        <span class="what">${escapeHtml(neighbourLabel(p))}</span>
+        <span class="cos">${n.similarity.toFixed(3)}</span>
+      </li>`;
+    })
+    .join("")}</ol>`;
+}
+
+/** Enough to tell two neighbours apart: what it is and where on the timeline. */
+function neighbourLabel(p) {
+  const m = p.meta || {};
+  if (p.modality === "text" && m.text) return truncate(m.text, 30);
+  if (m.frame_idx !== null && m.frame_idx !== undefined) {
+    return `frame ${m.frame_idx} @ ${formatTime(m.start_time)}`;
+  }
+  return formatTime(m.start_time);
+}
+
+function wireNeighbourList(q) {
+  for (const row of document.querySelectorAll("#detail .neighbours li")) {
+    const point = state.points[Number(row.dataset.i)];
+    if (!point) continue;
+    // Hover highlights on the map, so the list can be scanned without losing
+    // the query panel; only a click commits to opening the node.
+    row.addEventListener("mouseenter", () => { state.hovered = point; render(); });
+    row.addEventListener("mouseleave", () => { state.hovered = null; render(); });
+    row.addEventListener("click", () => {
+      centreOn(point);
+      select(point);
+    });
+  }
+}
+
+/** Pan to a point, keeping the zoom, so a click on a row goes to it. */
+function centreOn(p) {
+  if (!state.viewState) return;
+  state.viewState = { ...state.viewState, target: [p.x, p.y, 0] };
 }
 
 function queryMediaHtml(q) {
@@ -752,24 +859,61 @@ function wireUnlock(point) {
   input.focus();
 }
 
+/** The detection box a crop vector was embedded from, or null.
+ *
+ * Taggers that embed crops repeat the box into `additional_info` precisely
+ * because that is the only per-vector field a search row carries back — the
+ * `box` on the tag itself lands in `frame_info`, which the index does not
+ * store. Coordinates are normalized to [0, 1] against the full frame, so they
+ * map onto the frame image without knowing its pixel size.
+ *
+ * A whole-frame vector carries {0,0,1,1}: a real box, but drawing a rectangle
+ * around the entire frame says nothing, so it is treated as "no box".
+ */
+function detectionBox(meta) {
+  const b = meta?.additional_info?.box;
+  if (!b) return null;
+  const [x1, y1, x2, y2] = [b.x1, b.y1, b.x2, b.y2].map(Number);
+  if (![x1, y1, x2, y2].every(Number.isFinite)) return null;
+  if (x2 <= x1 || y2 <= y1) return null;
+  const wholeFrame = x1 <= 0.001 && y1 <= 0.001 && x2 >= 0.999 && y2 >= 0.999;
+  return wholeFrame ? null : { x1, y1, x2, y2 };
+}
+
+/** The box as a percentage-positioned overlay, so it scales with the image. */
+function boxOverlay(box, label) {
+  const pct = (v) => `${(v * 100).toFixed(3)}%`;
+  const style = `left:${pct(box.x1)};top:${pct(box.y1)};` +
+    `width:${pct(box.x2 - box.x1)};height:${pct(box.y2 - box.y1)}`;
+  return `<div class="det-box" style="${style}">${
+    label ? `<span>${escapeHtml(label)}</span>` : ""}</div>`;
+}
+
 /** How a clip's extent reads.
  *
- * An unsegmented whole-video vector carries start == end == 0, and playback
- * treats that as "no out point" and runs the whole thing — so labelling it
- * `0:00.000 – 0:00.000` would claim a zero-length clip while the full video is
- * playing.
+ * A row with no usable out point plays to the end of the file, so it must not be
+ * labelled `0:00.000 – 0:00.000` — that would claim a zero-length clip while the
+ * whole video runs. Two different rows land there, and they are not the same
+ * thing: the **last** segment of an object, which has no successor to derive an
+ * end from, and a whole-media vector tagged before the taggers began stamping a
+ * real duration. Calling the final shot of a video "Whole video" would be wrong.
  */
 function clipRange(meta) {
   const end = segmentEnd(meta);
-  if (end === null) return "Whole video";
+  if (end === null) {
+    return meta.segmented
+      ? `Final segment from ${formatTime(meta.start_time)} — plays to end`
+      : "Whole video";
+  }
   const suffix = meta.end_time > meta.start_time ? "" : " (derived)";
   return `Clip ${formatTime(meta.start_time)} – ${formatTime(end)}${suffix}`;
 }
 
 /** The out point to play to, or null to run to the end of the video.
  *
- * Prefers what the tagger recorded. `derived_end_time` is the reconstruction the
- * service makes for tag-aligned rows, whose own end is the re-based
+ * Prefers what the tagger recorded, which since 2026-09-10 is a real duration
+ * even for a whole-media vector. `derived_end_time` is the reconstruction the
+ * service makes for rows tagged before that, whose end is the re-based
  * start == end sentinel rather than a real bound — see `derive_segment_ends`.
  */
 function segmentEnd(meta) {
@@ -794,9 +938,14 @@ async function loadMedia(point) {
       const url = await frameImageUrl(client, meta.qid, (meta.start_time || 0) / 1000);
       if (token !== state.mediaToken) return;
       if (!url) return mediaFailed(host, "This object has no video offering.");
+      const box = detectionBox(meta);
       host.innerHTML = `
-        <img alt="Frame ${meta.frame_idx}" src="${url}">
-        <p class="caption">Frame ${meta.frame_idx} @ ${formatTime(meta.start_time)}</p>`;
+        <div class="frame">
+          <img alt="Frame ${meta.frame_idx}" src="${url}">
+          ${box ? boxOverlay(box, meta.tag) : ""}
+        </div>
+        <p class="caption">Frame ${meta.frame_idx} @ ${formatTime(meta.start_time)}${
+          box ? " — box shown" : ""}</p>`;
       host.querySelector("img").addEventListener("error", () =>
         mediaFailed(host, "The fabric refused this frame."));
       return;
@@ -905,36 +1054,39 @@ function drawLegend() {
 
 /** Reflect whether the model/modes were detected or declared by hand.
  *
- * A stamped recipe is authoritative, so the manual checkboxes are disabled
- * rather than left looking like they still decide anything.
+ * The model comes from the batch a vector was written in, which is
+ * authoritative, so the manual checkboxes are disabled rather than left looking
+ * like they still decide anything. `model_id` is "unknown" when no batch could
+ * be read — then the declared modes are all there is.
  */
-function applyRecipes(data) {
-  const recipes = Object.values(data.recipes || {});
-  const detected = recipes.length > 0;
+function applyDetectedModel(data) {
+  const model = data.model_id && data.model_id !== "unknown" ? data.model_id : null;
 
   document.querySelectorAll("#modes input").forEach((input) => {
-    input.disabled = detected;
-    if (detected) input.checked = data.modes.includes(input.value);
+    input.disabled = !!model;
+    if (model) input.checked = data.modes.includes(input.value);
   });
-  $("modes-field").title = detected
-    ? `Detected from the index's tags: ${data.model_id}`
-    : "This index's tags carry no embedding recipe, so declare its query modes here.";
-  $("modes-field").classList.toggle("detected", detected);
-  return detected ? recipes[0] : null;
+  $("modes-field").title = model
+    ? `Detected from the index's batches: ${model}`
+    : "No batch reported a model for this index, so declare its query modes here.";
+  $("modes-field").classList.toggle("detected", !!model);
+  return model;
 }
 
 function drawStats(data) {
-  const recipe = applyRecipes(data);
+  const model = applyDetectedModel(data);
   const parts = [
     `<b>${data.count.toLocaleString()}</b> vectors · <b>${data.vector_size}</b> dims · ${data.method.toUpperCase()}`,
   ];
 
   // Naming the source matters: "declared" means nothing verified that the model
   // shown is the one that built these vectors.
-  if (recipe) {
-    parts.push(`model <b>${escapeHtml(shortModel(recipe.embedder))}</b> · detected from tags`);
+  if (model) {
+    const tuned = Object.keys(data.tuning || {}).length;
+    parts.push(`model <b>${escapeHtml(model)}</b> · from batch${
+      tuned ? ` · ${tuned} stamped parameter${tuned === 1 ? "" : "s"}` : ""}`);
   } else {
-    parts.push(`model <b>${escapeHtml(shortModel(data.model_id))}</b> · <span class="warn">declared, not detected</span>`);
+    parts.push(`model <b>unknown</b> · <span class="warn">no batch reported one</span>`);
   }
   if (data.method === "pca") {
     // Worth surfacing: two PCA components typically retain only ~20% of the

@@ -10,18 +10,18 @@ Prototype of a visual (graphic) interface for an index using SigLIP2-base-naflex
    - iq__8MzaWjtTDuWuyTjAazYWnQDwPew has just video_vectors (Qwen) segmented by shot by the tagger
 1. API call to vector store to get vectors in an index. (May visualize all or a subset (top 500?) of them.)
    - extract the metadata
-      - embedding model info for index - currently in vector's additional_info, but there might be a way to get it from the tagstore without having it repeated in each vector?
+      - embedding model info for index - currently in vector's additional_info, but can be queried from vector batch info without having it repeated in each vector?
    - auth token handled by integration with elv-core
 2. Visual:
    - grid/graph background, Eluvio/EVIE color scheme (purplish)
    - each vector as a node
    - hover over a node highlights it and shows the vector's formatted metadata
      - if it is embedded text, show the text too
-   - different colors for different modality embeddings (vector for text vs. image vs. video) with a key/legend in the corner
+   - different colors (color-blind-friendly) for different modality embeddings (vector for text vs. image vs. video) with a key/legend in the corner
       - embedding model modality support also in vector's additional_info
       - if there is a frame_idx, show that frame/image
-      - if there's text, show the text
-      - if it's a video, play the clip from start_time to end_time (or whole video if start_time=end_time=0 as in current model-qwen-video-vector model)
+      - if there's a start_time and end_time and end_time > start_time, then it's a video
+      - else it's text
 3. Search:
    - search box in a corner
    - search query (text, image, or video) is embedded (using the vectors' embedding model (get from index)) and inserted as a new node in the same latent space (similar color to the query mode)
@@ -78,6 +78,59 @@ Two costs on the *first* Qwen query, neither repeated: the checkpoint downloads
 (`Qwen/Qwen3-VL-Embedding-8B` is **16.3 GB**) and then takes ~45 s to load. The
 model then stays resident.
 
+### Querying a celeb (face) index needs its own interpreter
+
+```
+tools/setup_celeb_env.sh      # once, ~1.5 GB
+```
+
+`face_vectors` indexes load and plot with no setup at all. **Querying** one
+needs model-celeb-vector's stack, which cannot coexist with the rest of the
+service: its `setup.py` pins `numpy<1.20.0`, `torch==1.9.0` and `mxnet`, where
+SigLIP 2 and Qwen run on torch 2.13 and numpy 2.x. Installing it into the
+service environment would downgrade numpy below 1.20 and break every other
+tower, plus UMAP and scikit-learn — so it is deliberately **not** in
+`requirements.txt`. (If the face embedder is updated, this may no longer apply.)
+
+So that stack gets its own interpreter and the service talks to it over a pipe:
+
+| | |
+|---|---|
+| `tools/setup_celeb_env.sh` | builds `.celebenv/` — Python 3.8, numpy 1.19.5, torch 1.9.0+cpu, mxnet 1.9.1 |
+| `tools/celeb_worker.py` | runs inside it; imports the real `CelebVectorizer`, one JSON line per query |
+| `src/celeb_embedder.py` | starts the worker once and keeps it, since r100 costs ~2 s to load |
+
+It is cheaper than it looks because the tagger sets `gpu: -1` and runs
+InsightFace on CPU deliberately, to match `celeb/model.py`. CPU wheels are
+therefore enough: no CUDA 10.1, no cudatoolkit, and none of the ~10 GB the
+tagger's conda container would cost. Python 3.8 comes from `uv` — this box has
+only 3.10, where `numpy<1.20` has no wheels.
+
+**The bridge does not change the vector.** Checked against calling the tagger
+directly on the same image: max absolute difference `0.0`, cosine `1.0`. Images
+cross as PNG on disk rather than as arrays over the pipe, because the two
+interpreters have incompatible numpy ABIs; decoding happens service-side so EXIF
+rotation is applied, which `cv2.imread` would ignore — a sideways phone photo
+would otherwise embed as a sideways face.
+
+Without `.celebenv/`, `celeb_embedder` falls back to importing in-process, which
+is the path that works *inside* the tagger's own container (`/elv`), and
+otherwise fails naming the missing module. `CELEB_PYTHON`,
+`CELEB_EMBEDDING_PATH`, `COMMON_ML_PATH` and `CELEB_MODEL_PATH` override the
+interpreter, the two checkouts and the weights.
+
+**The weights are not where `config.yml` says.** It names
+`/ml/models/celeb_detection`; the r100 checkpoint actually lives at
+`/ml/models/celeb` (`models/model-r100-ii/model-{symbol.json,0000.params}`),
+which is what `model_input_path` is joined against.
+
+Expect a few seconds per query: MTCNN detection runs on CPU, so a 10-megapixel
+upload takes ~7 s while a smaller one is much faster.
+
+Face vectors are **image-only**: they are identity embeddings, so no text tower
+can put a description into that space, and a text query is refused rather than
+answered with something meaningless.
+
 ### GPU selection
 
 The tagger asks for a bare `torch.device("cuda")`, which means *the current
@@ -114,10 +167,11 @@ Backend (Python):
 |---|---|
 | `src/app.py`          | HTTP service; serves the API and the frontend from one origin |
 | `src/vectors_api.py`  | enumerates and samples an index out of the vectorstore |
-| `src/recipes.py`      | parses the embedding recipe a tagger stamped on each vector |
 | `src/projection.py`   | PCA → UMAP to 2D, plus the query's neighbour anchoring |
-| `src/embedder.py`     | SigLIP 2 towers, and the recipe → embedder registry |
+| `src/embedder.py`     | the model → embedder registry, and the tuning parameters |
+| `src/siglip2_embedder.py` | SigLIP 2 image and text towers |
 | `src/qwen_embedder.py`| Qwen3-VL text/image/**video** queries, via the tagger's embedder |
+| `src/celeb_embedder.py`| InsightFace face queries, via model-celeb-vector's model |
 
 Frontend (JavaScript, no build step):
 
@@ -179,13 +233,19 @@ says to compare within a mode rather than across.
 
 **The embedding recipe comes from the tags, not the index.** A tagger stamps
 `additional_info` on every tag it writes — `embedder`, `revision`, `dim`,
-`normalize`, `kind`, `query_modes`, plus whatever else changes the vector
+`normalize`, `query_modes`, plus whatever else changes the vector
 (`max_num_patches` for SigLIP 2; `prompt`, `fps`, `max_frames`, `max_length` for
 Qwen). The vectorstore stores it as JSONB and returns it **verbatim on every
 search hit**, so the recipe arrives on the same row as the vector and no second
-lookup is needed — `read_recipes` parses what `get_vectors` already fetched. It
+lookup is needed — `read_tuning` parses what `get_vectors` already fetched. It
 is opaque to the index though: not indexed and not filterable, so it can ride
 along but cannot narrow a search.
+
+**It no longer says which model to use.** That comes from the batch (below);
+`additional_info` is read only for the parameters that *tune* an already-chosen
+tower, via a whitelist (`embedder.TUNING_KEYS`) so the provenance a tagger also
+stamps — `box`, `score`, `upscale`, `crop_padding`, `detector`, `text` — never
+reaches an embedder.
 
 It answers the two things the index cannot: which model to embed a query with,
 and which query modes that model supports. When a recipe is found the query mode
@@ -209,10 +269,15 @@ neighbours. So both embedders run the tagger's own code:
   `{text|image|video, instruction, fps, max_frames}`. Video uploads go to a temp
   file keeping their suffix, since the reader opens paths and picks its decoder
   by extension.
-- `src/embedder.py`'s image path runs the SigLIP tagger's `FeatureExtractor`,
-  falling back to a local vision tower when the tagger is not importable. The
-  two were checked against each other on a real frame: **bit-identical**, max
-  absolute difference `0.000e+00`. Its *text* path has no counterpart to import
+- `src/embedder.py`'s image path runs model-frame-vector's `Siglip2CropEmbedder`
+  (the repo formerly named model-detection; its package is still
+  `general_detection`), falling back to a local vision tower when it is not
+  importable. It replaced model-vector's `FeatureExtractor` on 2026-09-10 and
+  was checked against the fallback on a non-square image: **bit-identical**, max
+  absolute difference `0.000e+00`, cosine `1.0`. Its extra `max_upscale` lever
+  only shrinks the patch budget for small *crops*; left at its default of None
+  a whole-image query gets the full `max_num_patches`, which is the budget the
+  frame tagger always used. Its *text* path has no counterpart to import
   — that tagger only ever loads the vision tower — so the text tower is
   necessarily query-side code.
 
@@ -220,15 +285,23 @@ Both resolve the tagger the same way: plain import first (`/elv` is the tagger
 container's WORKDIR and already on `sys.path`), then `QWEN_EMBEDDING_PATH` /
 `SIGLIP_EMBEDDING_PATH`, then a sibling checkout. No home paths.
 
-**Modality** comes from the track's stamped `kind` when there is one. `kind` is
-what the vectors *are*, which settles a case the field heuristic gets wrong: an
-unsegmented whole-video tag carries `start == end == 0` and no `frame_idx`, so
-the heuristic reads it as `unknown` and refuses to play the clip. Without a
-recipe it falls back to which fields a row populates, in order: `text` → `text`;
-`frame_idx` → `image`; `end_time` strictly greater than `start_time` → `video`;
-otherwise `unknown`, which shows metadata and does not try to load media. The
-order matters — frame rows carry `start_time == end_time`, because a frame is an
-instant, so a looser video test would swallow every frame in the index.
+**Modality** is read from which fields a row populates, in order: `text` →
+`text`; `frame_idx` → `image`; `end_time` strictly greater than `start_time` →
+`video`; otherwise `unknown`, which shows metadata and does not try to load
+media. The order matters — frame rows carry `start_time == end_time`, because a
+frame is an instant, so a looser video test would swallow every frame in the
+index.
+
+A stamped `kind` still wins when a row carries one, but the taggers stopped
+stamping it on 2026-09-10, so the field test above is the normal path. What made
+that safe was the taggers starting to record a **real duration** on a whole-media
+vector. The one case the field test genuinely cannot read is the old
+`start == end == 0` sentinel: a lone vector with no interval and no `frame_idx`
+is indistinguishable from an unknown row, which is what `kind` had been covering.
+With `end > start` it simply matches the video rule.
+
+Rows tagged before that change are still handled, but by
+`derive_segment_ends` rather than by `kind` — see *Clips play their own segment*.
 
 **A query node is placed among its matches, not by projecting it.** This is the
 one place the pipeline deliberately departs from "same treatment as an index
@@ -333,25 +406,41 @@ neither has a `.message`, so reading it directly renders the string
 
 ### Clips play their own segment
 
-Playback seeks to `start_time` and pauses at `end_time` rather than running on
-into the next scene. A vector with `start == end == 0` has **no** out point and
-plays the whole video.
+Playback seeks to `start_time` and pauses at the row's end. A row with no usable
+end has no out point and plays to the end of the file.
 
-That sentinel is deliberate on the tagger side, not an accident of empty fields.
-`model-qwenvl-video-vector` windows a video itself and stamps each window with
-its true bounds, collapsing them only when the whole video was embedded as one:
+When the tagger windows a video itself — `segment_length_s` — each window is
+stamped with its true bounds and none of this is needed. The awkward case is
+**tag-aligned** tagging, where the pipeline cuts the video first (by the
+`shot_detection` track, say) and hands the tagger one piece at a time. The
+tagger sees a single window in that piece, so it stamps the whole-media values
+and the pipeline then re-bases the row into the parent timeline.
 
-```python
-st, et = (0, 0) if single_window else (start_ms, end_ms)
-```
+Historically that sentinel was `(0, 0)`, and re-basing shifted **both** fields
+together, leaving `start == end == segment start` — a row that reads as "whole
+video" and plays past its own segment. `derive_segment_ends` reconstructs those:
 
-So a segment vector carries a real `start_time` *and* `end_time`, and the
-whole-video case is distinguishable from a segment that merely begins at zero.
-Both halves of the behaviour follow from that with no extra plumbing.
+> **end(segment *i*) = start(segment *i+1*)**, the last one left open
 
-It is also why modality must come from the recipe's `kind` rather than from
-which fields are populated: a whole-video tag has no `frame_idx` and `start ==
-end == 0`, which the field heuristic reads as `unknown`.
+It assumes only that segments **tile the timeline contiguously without
+overlap**, which is true of shot alignment and fixed-length alignment alike, so
+it keys off neighbouring starts rather than anything shot-specific. It would be
+wrong for *overlapping* windows and overshoots a genuine gap; neither is
+distinguishable from tiling using these rows alone, since the real end is
+exactly what is missing.
+
+Ends are derived from the **counting pass**, which walks the whole index at
+~150 B/row, not from the sample. A sampled row therefore carries the bound it
+has in the full index rather than one stretched across dropped neighbours.
+
+Since 2026-09-10 the tagger stamps a real duration instead of `(0, 0)`, so
+re-tagged rows arrive with `end > start` and the derivation goes dormant on its
+own. It stays for rows tagged before that, and is keyed on `end <= start` rather
+than on anything about shots.
+
+Nothing is overwritten: the reconstruction is written to `derived_end_time`, so
+a row keeps reporting what the tagger recorded and the UI can label a
+reconstructed bound `(derived)`.
 
 ## Verified against the live vectorstore
 
@@ -426,11 +515,11 @@ Checked 2026-09-09 with the app loaded as a plug-in in a running elv-core-js:
   the resident model. The tagger's runtime deps are now listed in
   `requirements.txt` — they are *not* implied by installing the rest, so a fresh
   environment fails with an import error until they are installed.
-- **One recipe per index.** A query has to be embedded with one model, so if an
-  index mixes tracks from different taggers the first recipe wins. All of them
-  are returned in `recipes` so a mismatch is at least visible.
+- **One model per index.** A query has to be embedded with one model, so if an
+  index mixes batches from different taggers the first model wins. All of them
+  are returned in `models` (batch id → model) so a mismatch is at least visible.
 - **The SigLIP text tower is still query-side code.** The image half now runs the
-  tagger's own `FeatureExtractor`, so that contract cannot drift. The text half
+  tagger's own `Siglip2CropEmbedder`, so that contract cannot drift. The text half
   has nothing to import — the tagger only ever loads the vision tower — so its
   `padding="max_length"`, `max_length=64` tokenization is duplicated with
   content-search's copy, and a mismatch there does not raise, it just returns

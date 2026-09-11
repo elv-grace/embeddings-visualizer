@@ -18,10 +18,24 @@
 
   /* Modality colours. Kept inside one purple-to-magenta family so they read as
      one system, but far enough apart in hue to separate at 3px. Mirrored in
-     app.js MODALITY — change both together. */
-  --m-text:    #3fd0c9;
+     app.js MODALITY — change both together.
+
+     Chosen against simulated colour vision deficiency, not by eye. Every pair —
+     including the lightened query tints, which is where the old palette failed —
+     stays above CIE76 dE 15 under protanopia, deuteranopia and tritanopia:
+
+       before  teal #3fd0c9 / pink #ff6fb5   prot 6.3   deut 6.7   (a text vector
+               was indistinguishable from a video query node)
+       after   mint #9efae3 / rose #ef5a6b   prot 17.8  deut 16.9  trit 16.6
+
+     `image` stays on core's dark accent (#8b7bff) and `video` sits in the rose
+     family core already uses, so this stays on-brand. Orange or yellow score no
+     better than this and are absent from core's palette, where the only warm
+     hue means danger. */
+  /* --m-text:  #3fd0c9;  --m-video: #ff6fb5;  (pre-CVD-audit) */
+  --m-text:    #9efae3;
   --m-image:   #9b7dff;
-  --m-video:   #ff6fb5;
+  --m-video:   #ef5a6b;
   --m-unknown: #6b6880;
   --m-query:   #ffd166;
 
@@ -309,6 +323,25 @@ button.help:hover { color: var(--text); border-color: var(--accent); }
 #detail h2 { margin: 0 0 10px; font-size: 13px; display: flex; align-items: center; gap: 7px; }
 #detail h2 .dot { width: 9px; height: 9px; border-radius: 50%; }
 #detail img, #detail video { width: 100%; border-radius: 6px; background: #000; display: block; }
+
+/* Detection box drawn over the frame. Positioned in percentages so it tracks
+   the image at any panel width — the stored box is normalized, not in pixels. */
+#detail .frame { position: relative; line-height: 0; }
+#detail .det-box {
+  position: absolute;
+  border: 2px solid var(--m-query);
+  border-radius: 2px;
+  /* Readable over both bright and dark frames without hiding what is inside. */
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, .55), inset 0 0 0 1px rgba(0, 0, 0, .55);
+  pointer-events: none;
+}
+#detail .det-box span {
+  position: absolute; left: -2px; bottom: 100%;
+  background: var(--m-query); color: #12101a;
+  font-size: 10px; font-weight: 600; line-height: 1.5;
+  padding: 0 4px; border-radius: 2px 2px 0 0;
+  white-space: nowrap;
+}
 #detail .quote {
   background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
   padding: 10px; margin: 0 0 12px; white-space: pre-wrap;
@@ -324,6 +357,29 @@ button.help:hover { color: var(--text); border-color: var(--accent); }
   margin: 8px 0 0; color: var(--muted); font-variant-numeric: tabular-nums;
 }
 #detail .caption button { margin-left: auto; padding: 3px 9px; font-size: 12px; }
+
+/* Ranked neighbours of a query. A list because a dense cluster makes the map
+   useless for "which node is the third best match" — see neighbourList(). */
+#detail .neighbours { list-style: none; margin: 0 0 10px; padding: 0; }
+#detail .neighbours li {
+  display: flex; align-items: center; gap: 7px;
+  padding: 4px 6px; border-radius: 4px;
+  cursor: pointer; font-size: 12px; line-height: 1.3;
+}
+#detail .neighbours li:hover { background: var(--panel-2); }
+#detail .neighbours .rank {
+  min-width: 15px; text-align: right;
+  color: var(--muted); font-variant-numeric: tabular-nums;
+}
+#detail .neighbours .dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+/* The label yields space first; rank and score must stay readable. */
+#detail .neighbours .what {
+  flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+#detail .neighbours .cos {
+  color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+}
 #detail .unlock {
   border: 1px solid var(--line); border-radius: 6px;
   padding: 12px; margin-bottom: 12px; background: var(--bg);

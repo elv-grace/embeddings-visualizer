@@ -32,11 +32,14 @@ is not a sample of the index.
 
 from __future__ import annotations
 
+import logging
 import random
 from bisect import bisect_right
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import requests
+
+logger = logging.getLogger(__name__)
 
 VECTORSTORE_URL = "http://localhost:8108"
 
@@ -166,6 +169,46 @@ def get_track_counts(index_qid: str, auth_token: str) -> Dict[str, int]:
     return {t.get("name", "?"): t.get("count", 0) for t in tracks}
 
 
+def get_batch(index_qid: str, batch_id: str, auth_token: str) -> Dict[str, Any]:
+    """GET /indexes/{qid}/batches/{batch_id} -- the batch a vector was written in.
+
+    Its `model` field is what names the embedding model. `batch_id` must be a
+    UUID: the handler validates the shape before authorizing, so a malformed one
+    comes back 400 `Field validation for 'BatchID' failed on the 'uuid' tag`
+    rather than "not found". Authorization is against the *index* qid, exactly
+    like every other call here, so the same token serves.
+    """
+    response = requests.get(
+        f"{VECTORSTORE_URL}/indexes/{index_qid}/batches/{batch_id}",
+        headers=_headers(auth_token),
+        timeout=TIMEOUT_SECONDS,
+    )
+    _check(response, f"read of batch {batch_id} in {index_qid}")
+    return response.json() or {}
+
+
+def batch_models(
+    index_qid: str, metadata: List[Dict[str, Any]], auth_token: str
+) -> Dict[str, str]:
+    """Map each `batch_id` present in the rows to the batch's `model`.
+
+    One lookup per distinct batch rather than per row: a batch is one tagger run,
+    so every row in it shares a model. Batches that cannot be read are skipped
+    rather than fatal -- an index whose model is unknown still plots, it just
+    cannot embed a query.
+    """
+    models: Dict[str, str] = {}
+    for batch_id in {(m.get("batch_id") or "") for m in metadata} - {""}:
+        try:
+            model = (get_batch(index_qid, batch_id, auth_token) or {}).get("model")
+        except Exception as exc:
+            logger.warning(f"could not read batch {batch_id}: {exc}")
+            continue
+        if model:
+            models[batch_id] = str(model)
+    return models
+
+
 def _random_probe(vector_size: int, rng: random.Random) -> List[float]:
     """A uniformly random direction on the unit sphere."""
     raw = [rng.gauss(0.0, 1.0) for _ in range(vector_size)]
@@ -217,7 +260,7 @@ def count_windows(
             continue
         if len(rows) >= WINDOW_LIMIT:
             # More than WINDOW_LIMIT rows share one timestamp; cannot split further.
-            print(f"warning: window [{lo}, {hi}] is saturated, rows beyond {WINDOW_LIMIT} are invisible")
+            logger.warning(f"window [{lo}, {hi}] is saturated, rows beyond {WINDOW_LIMIT} are invisible")
         windows.append((lo, hi, len(rows)))
 
         for row in rows:
@@ -270,6 +313,11 @@ def derive_segment_ends(
     what the tagger actually recorded, so a reconstructed bound can be labelled
     as reconstructed.
     """
+    # An object is segmented if its rows sit at more than one start time. That is
+    # what distinguishes a re-based segment from a genuine whole-media vector,
+    # both of which carry start == end.
+    segmented_qids = {qid for qid, starts in starts_by_qid.items() if len(set(starts)) > 1}
+
     filled = 0
     for meta in metadata:
         start, end = meta.get("start_time"), meta.get("end_time")
@@ -277,7 +325,14 @@ def derive_segment_ends(
             continue   # a real interval; nothing to derive
         if meta.get("frame_idx") is not None or (meta.get("text") or "").strip():
             continue
-        starts = starts_by_qid.get(meta.get("qid") or "") or []
+        qid = meta.get("qid") or ""
+        if qid not in segmented_qids:
+            continue   # a lone vector for this object: not a segment
+        # Marked even when the end cannot be derived, because *being a segment*
+        # is what the modality test needs; the final segment of each object has
+        # no successor and keeps an open end.
+        meta["segmented"] = True
+        starts = starts_by_qid.get(qid) or []
         nxt = bisect_right(starts, int(start))
         if nxt >= len(starts):
             continue   # last segment of this object: leave open
@@ -321,13 +376,13 @@ def get_vectors(
     vector_size = index.get("vector_size")
     if not vector_size:
         raise VectorStoreError(f"index {index_qid} reported no vector_size: {index}")
-    print(f"Index `{index_qid}`: vector_size={vector_size}")
+    logger.info(f"Index `{index_qid}`: vector_size={vector_size}")
 
     track_counts = get_track_counts(index_qid, auth_token)
     if track_counts:
-        print(f"Tracks: {track_counts} (total {sum(track_counts.values())})")
+        logger.info(f"Tracks: {track_counts} (total {sum(track_counts.values())})")
 
-    print("Counting rows per window (no vectors)...")
+    logger.info("Counting rows per window (no vectors)...")
     # windows = count_windows(index_qid, auth_token, _random_probe(vector_size, rng), sources)
     # Also returns every row's start_time, which is what segment ends are derived
     # from -- collected here because this pass sees the whole index, not the sample.
@@ -337,7 +392,7 @@ def get_vectors(
     population = sum(count for _, _, count in windows)
     if population == 0:
         return [], []
-    print(f"Enumerated {population} rows across {len(windows)} windows")
+    logger.info(f"Enumerated {population} rows across {len(windows)} windows")
 
     quotas = _quotas([count for _, _, count in windows], sample_size)
 
@@ -365,11 +420,11 @@ def get_vectors(
             vectors.append(vector)
             metadata.append(entry)
 
-    print(f"Retrieved {len(vectors)} of {population} vectors from index `{index_qid}`")
+    logger.info(f"Retrieved {len(vectors)} of {population} vectors from index `{index_qid}`")
 
     filled = derive_segment_ends(metadata, starts_by_qid)
     if filled:
-        print(f"Derived an end time for {filled} segment rows that carried none")
+        logger.info(f"Derived an end time for {filled} segment rows that carried none")
     return vectors, metadata
 
 
@@ -379,6 +434,18 @@ def modality(meta: Dict[str, Any]) -> str:
     Order matters. Frame rows carry start_time == end_time (a frame is an instant,
     not an interval), so the video test has to be a strict inequality and has to
     run after the frame_idx test -- otherwise every frame reads as a video.
+
+    The two segment fields are part of the same test, not an extra rule, and they
+    only matter for rows tagged before the tagger began stamping a real duration
+    on a whole-media vector. Those reach here with start == end: the tagger
+    stamped the "whole of this media" sentinel for the one segment it was handed
+    and the pipeline re-based both fields together. `derive_segment_ends`
+    recovers the interval, so an unsegmented row is still `unknown` and only a
+    row shown to be a segment reads as video -- without it a shot-aligned index
+    tagged that way plots entirely as `unknown` and loses its player.
+
+    Re-tagged rows carry end > start and match on the plain rule above, so this
+    goes dormant on its own rather than needing to be removed.
     """
     if (meta.get("text") or "").strip():
         return "text"
@@ -386,6 +453,8 @@ def modality(meta: Dict[str, Any]) -> str:
         return "image"
     start, end = meta.get("start_time"), meta.get("end_time")
     if start is not None and end is not None and end > start:
+        return "video"
+    if meta.get("segmented") or (meta.get("derived_end_time") or 0) > (start or 0):
         return "video"
     return "unknown"
 

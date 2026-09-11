@@ -216,7 +216,7 @@ export async function frameImageUrl(client, qid, seconds) {
   const token = await objectToken(client, qid);
   // ignore_trimming: without it the frame is addressed against the trimmed
   // timeline, which is not the timeline the tagger recorded timestamps against.
-  return `${node}/q/${qid}/rep/frame/${frame}/video` +
+  return `${node}/q/${qid}/rep/frame_extract/${frame}/video` +
     `?t=${t}&ignore_trimming=true&authorization=${encodeURIComponent(token)}`;
 }
 

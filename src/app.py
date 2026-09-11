@@ -13,27 +13,77 @@ displayable at all.
 
 from __future__ import annotations
 
+import logging
+import logging.handlers
+import os
 import threading
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 from flask import Flask, jsonify, request, send_from_directory
 
 from embedder import (
-    DEFAULT_MAX_NUM_PATCHES,
-    DEFAULT_MODEL_ID,
-    DEFAULT_REVISION,
     EmbeddingError,
-    QueryEmbedder,
-    build_embedder,
+    build_embedder_for_model,
+    query_modes_for,
+    read_tuning,
 )
-from recipes import Recipe, read_recipes
 from projection import METHODS, Projector, ProjectionError, anchor_to_neighbours, top_k_similar
-from vectors_api import DEFAULT_SAMPLE_SIZE, VectorStoreError, get_track_counts, get_vectors, modality
+from vectors_api import (
+    DEFAULT_SAMPLE_SIZE,
+    VectorStoreError,
+    batch_models,
+    get_track_counts,
+    get_vectors,
+    modality,
+)
 
-PORT = 8099
+logger = logging.getLogger(__name__)
+
+PORT = int(os.environ.get("EV_PORT") or 8099)
+
+# Beside the repo, not in /tmp: a scratch path is wiped between sessions and on
+# reboot, which loses exactly the history worth having. Override with EV_LOG_FILE.
+LOG_FILE = Path(
+    os.environ.get("EV_LOG_FILE")
+    or Path(__file__).resolve().parents[1] / "logs" / "visualizer.log"
+)
+LOG_MAX_BYTES = 5 * 1024 * 1024
+LOG_BACKUPS = 3
+
+
+def configure_logging(path: Path = LOG_FILE) -> Path:
+    """Send this service's output to a rotating file as well as the console.
+
+    Everything interesting used to go through `print`, which is why redirecting
+    the process to a file appeared to produce nothing: Python line-buffers
+    stderr but *block*-buffers stdout when it is not a TTY, so werkzeug's
+    request lines (stderr) showed up while every print sat in an 8 KB buffer
+    that a long-running server never fills. Logging writes and flushes per
+    record, so it does not depend on how the process was launched.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.handlers.RotatingFileHandler(
+        path, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUPS, encoding="utf-8"
+    )
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
+    )
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    # Idempotent: a reload must not attach a second handler and double every line.
+    if not any(isinstance(h, logging.handlers.RotatingFileHandler) for h in root.handlers):
+        root.addHandler(handler)
+    if not any(isinstance(h, logging.StreamHandler)
+               and not isinstance(h, logging.handlers.RotatingFileHandler)
+               for h in root.handlers):
+        root.addHandler(logging.StreamHandler())
+    # werkzeug logs the request lines; without this they stay on stderr only.
+    logging.getLogger("werkzeug").setLevel(logging.INFO)
+    return path
 
 # Modes a caller may declare. The index does not record which model built it, so
 # the caller supplies the model and its modes; see embedder.py's docstring.
@@ -62,21 +112,19 @@ class LoadedIndex:
     modes: List[str]
     model_id: str
     tracks: Dict[str, int] = field(default_factory=dict)
-    # Per-track recipes read off the search rows. Empty when the content was
-    # tagged before taggers stamped `additional_info`, which is when the
-    # caller-declared model and modes are used instead.
-    recipes: Dict[str, Recipe] = field(default_factory=dict)
-    embedder: Optional[QueryEmbedder] = None
+    # The model each batch in this index reports, and the one queries embed
+    # with. `model` is the first -- one index can hold batches from different
+    # taggers, but a query has to be embedded with one model, so the response
+    # returns them all for a mismatch to be visible.
+    models: Dict[str, str] = field(default_factory=dict)
+    # Parameters a tagger stamped in additional_info, when it stamped any. These
+    # only tune the tower the batch's model already chose -- see embedder.TUNING_KEYS.
+    tuning: Dict[str, Any] = field(default_factory=dict)
+    embedder: Optional[Any] = None
 
     @property
-    def recipe(self) -> Optional[Recipe]:
-        """The recipe to embed a query with.
-
-        One index can hold tracks from different taggers, but a query has to be
-        embedded with one model, so this takes the first and the response
-        reports every recipe found for the caller to notice a mismatch.
-        """
-        return next(iter(self.recipes.values()), None)
+    def model(self) -> Optional[str]:
+        return next(iter(self.models.values()), None)
 
 
 _indexes: Dict[str, LoadedIndex] = {}
@@ -120,19 +168,45 @@ def create_app(static_dir: str = "../web") -> Flask:
             return _error(f"could not read index: {exc}", 502)
 
         if not vectors:
-            return _error(f"index {index_qid} returned no vectors", 404)
+            # Say which of the two this is. The index answered (a missing or
+            # unreadable one raises above and returns 400/502), so either it
+            # genuinely holds nothing, or it holds rows the timeline walk cannot
+            # reach -- rows whose start_time is null or outside
+            # [0, MAX_START_TIME_MS] are invisible to a start_time-filtered
+            # search. The track counts separate those two without another guess.
+            try:
+                counts = get_track_counts(index_qid, token)
+            except Exception:
+                counts = {}
+            total = sum(counts.values())
+            detail = (
+                f"but its tracks report {total} rows ({counts}) -- those rows are not "
+                "reachable by a start_time-filtered search, so check start_time is set"
+                if total
+                else "and its tracks report no rows either, so the index is empty"
+            )
+            logger.warning(f"index {index_qid} enumerated 0 rows; tracks={counts}")
+            return _error(f"index {index_qid} returned no vectors, {detail}", 404)
 
         try:
             tracks = get_track_counts(index_qid, token)
         except Exception:
             tracks = {}
 
-        # The recipe the tagger stamped, read off the rows already fetched --
-        # the vectorstore returns additional_info verbatim on every search hit.
-        recipes = read_recipes(metadata)
-        if recipes:
-            detected = next(iter(recipes.values()))
-            modes = detected.query_modes or modes
+        # Which model built this index, from the batches its rows name. One
+        # lookup per distinct batch, and authorized by the same index token.
+        models = batch_models(index_qid, metadata, token)
+        model = next(iter(models.values()), None)
+        if model:
+            logger.info(f"Index model: {model} (from {len(models)} batch(es))")
+            # Modes follow the model, not anything a vector carries.
+            modes = query_modes_for(model) or modes
+
+        # additional_info is read for one thing only now: the parameters that
+        # tune the tower the batch already chose. It cannot select a model.
+        tuning = read_tuning(metadata)
+        if tuning:
+            logger.info(f"Tuning parameters stamped on the rows: {sorted(tuning)}")
 
         matrix = np.asarray(vectors, dtype=np.float32)
         projector = Projector(method=method, seed=seed)
@@ -153,13 +227,10 @@ def create_app(static_dir: str = "../web") -> Flask:
                 coords=coords,
                 projector=projector,
                 modes=modes,
-                model_id=(
-                    recipes[next(iter(recipes))].embedder
-                    if recipes
-                    else (body.get("model_id") or DEFAULT_MODEL_ID)
-                ),
+                model_id=model or "unknown",
                 tracks=tracks,
-                recipes=recipes,
+                models=models,
+                tuning=tuning,
             )
 
         return jsonify(
@@ -169,15 +240,16 @@ def create_app(static_dir: str = "../web") -> Flask:
                 "method": method,
                 "modes": modes,
                 "model_id": _indexes[key].model_id,
+                "models": models,
                 "count": len(metadata),
                 "vector_size": int(matrix.shape[1]),
                 "tracks": tracks,
                 # Empty when nothing was stamped; the UI then says the model and
                 # modes were declared rather than detected.
-                "recipes": {t: r.to_json() for t, r in recipes.items()},
+                "tuning": tuning,
                 "bbox": projector.bbox,
                 "explained_variance": projector.explained_variance,
-                "points": _points(coords, metadata, recipes),
+                "points": _points(coords, metadata),
             }
         )
 
@@ -198,20 +270,10 @@ def create_app(static_dir: str = "../web") -> Flask:
 
         if loaded.embedder is None:
             width = int(loaded.vectors.shape[1])
+            # The batch's model chooses the tower; the stamped parameters, if
+            # any, only tune it.
             try:
-                # A stamped recipe names the model and the parameters its vectors
-                # were produced under; without one, fall back to the defaults the
-                # caller declared against.
-                loaded.embedder = (
-                    build_embedder(loaded.recipe, width)
-                    if loaded.recipe
-                    else QueryEmbedder(
-                        model_id=loaded.model_id,
-                        revision=DEFAULT_REVISION,
-                        max_num_patches=DEFAULT_MAX_NUM_PATCHES,
-                        target_size=width,
-                    )
-                )
+                loaded.embedder = build_embedder_for_model(loaded.model, width, loaded.tuning)
             except EmbeddingError as exc:
                 return _error(str(exc), 422)
 
@@ -288,27 +350,18 @@ def create_app(static_dir: str = "../web") -> Flask:
 
 
 def _points(
-    coords: np.ndarray,
-    metadata: List[Dict[str, Any]],
-    recipes: Optional[Dict[str, Recipe]] = None,
+    coords: np.ndarray, metadata: List[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
     """The per-node payload: position, modality, and the metadata for the card.
 
-    Modality comes from the track's stamped `kind` when there is one, and only
-    falls back to inferring it from populated fields otherwise. The inference is
-    wrong for whole-video tags — start == end == 0 and no frame_idx reads as
-    "unknown" — which is exactly what `kind` exists to settle.
-    """
-    recipes = recipes or {}
+    Modality is inferred from which fields a row populates -- see
+    `vectors_api.modality`."""
     return [
         {
             "i": i,
             "x": float(coords[i][0]),
             "y": float(coords[i][1]),
-            "modality": (
-                (recipes.get(meta.get("track") or "") or Recipe(embedder="")).modality
-                or modality(meta)
-            ),
+            "modality": modality(meta),
             "meta": meta,
         }
         for i, meta in enumerate(metadata)
@@ -339,5 +392,10 @@ def _warm_umap() -> None:
 
 
 if __name__ == "__main__":
+    log_path = configure_logging()
+    logging.getLogger(__name__).info(f"starting on port {PORT}, logging to {log_path}")
+    # Also on stdout, so `python3 src/app.py` says where its log went even when
+    # the console is where someone is looking.
+    print(f"embeddings-visualizer: port {PORT}, log {log_path}", flush=True)
     threading.Thread(target=_warm_umap, daemon=True).start()
     create_app().run(host="0.0.0.0", port=PORT, debug=False, threaded=True)

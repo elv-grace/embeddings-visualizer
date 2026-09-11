@@ -42,7 +42,14 @@
 
   <label class="field narrow">
     <span>Sample</span>
-    <input id="sample-size" type="number" min="1" step="500" value="10000">
+    <!-- Deliberately unbounded. Asking for more than the index holds simply
+         loads all of it, and a browser survives far more than expected:
+         measured at 500k points the page parsed in 2.6 s and rendered in
+         0.3 s. What degrades first is hover picking, whose cost grows with the
+         point count, and the vectorstore fetch (~12 KB/vector). -->
+    <input id="sample-size" type="number" min="1" step="500" value="10000"
+           title="Vectors to fetch and project — the whole index when it holds fewer.
+10k loads in seconds; 100k costs ~1.2 GB from the vectorstore and ~80 s in UMAP.">
   </label>
 
   <!-- PCA and UMAP fail in opposite directions, so both stay reachable:
@@ -60,7 +67,7 @@
        picture is not self-evident. -->
   <button id="help-toggle" class="help" title="How to use" aria-label="How to use">?</button>
 
-  <!-- Only used when the index's tags carry no stamped recipe. When they do,
+  <!-- Only used when no batch reported a model for the index. When one does,
        the model and its query modes are detected and these are disabled. -->
   <div class="field narrow" id="modes-field">
     <span>Query modes</span>
