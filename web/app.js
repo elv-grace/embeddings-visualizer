@@ -1081,7 +1081,7 @@ function boxOverlay(box, label) {
  * player — see `unknownReason`.
  */
 function clipRange(meta) {
-  return `Clip ${formatTime(meta.start_time)} – ${formatTime(meta.end_time)}`;
+  return `${formatTime(meta.start_time)} – ${formatTime(meta.end_time)}`;
 }
 
 
