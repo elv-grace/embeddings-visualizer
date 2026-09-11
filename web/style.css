@@ -39,6 +39,17 @@
   --m-unknown: #6b6880;
   --m-query:   #ffd166;
 
+  /* The bar's control row, and the headroom above it. The headroom is extra
+     *padding* rather than a margin, so the panel colour runs right up to core's
+     header and the separation reads as breathing room inside this app's bar
+     rather than as a third stripe between the two.
+
+     Both live here because #stage sizes itself from them: add to one without
+     subtracting from the stage and the canvas runs past the viewport, where
+     `overflow: hidden` silently clips the bottom of the plot. */
+  --bar-h: 62px;
+  --bar-gap: 12px;
+
   --radius: 8px;
 }
 
@@ -66,10 +77,12 @@ b { font-weight: 600; }
   display: flex;
   align-items: flex-end;
   gap: 12px;
-  padding: 10px 14px;
+  /* Extra top padding, not a margin: it keeps the controls clear of core's
+     header above without exposing a strip of page background between them. */
+  padding: calc(10px + var(--bar-gap)) 14px 10px;
   background: var(--panel);
   border-bottom: 1px solid var(--line);
-  height: 62px;
+  height: calc(var(--bar-h) + var(--bar-gap));
 }
 
 .brand {
@@ -174,7 +187,7 @@ button.help:hover { color: var(--text); border-color: var(--accent); }
 
 /* ---------- stage ---------- */
 
-#stage { position: relative; height: calc(100% - 62px); }
+#stage { position: relative; height: calc(100% - var(--bar-h) - var(--bar-gap)); }
 #canvas { position: absolute; inset: 0; }
 #canvas canvas { display: block; }
 
