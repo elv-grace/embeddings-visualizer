@@ -75,6 +75,9 @@ const state = {
 
 // Exposed for debugging from the console (and for the browser tests).
 window.__state = state;
+// Exposed for the browser tests, like __state above.
+window.__test_extraMetadata = (meta) => extraMetadata(meta);
+window.__test_wireFieldHelp = (root) => wireFieldHelp(root);
 
 const LINK_HOLD_MS = 4000;
 const LINK_FADE_MS = 700;
@@ -141,14 +144,18 @@ function cssVar(name) {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 }
 
-/** ms → m:ss.mmm, the form the fabric's time fields are read in. */
+/** ms → HH:MM:SS.mmm, the form the fabric's time fields are read in.
+ *
+ * Fixed-width rather than trimmed, so a column of timecodes lines up and two
+ * can be compared by eye without counting digits.
+ */
 function formatTime(ms) {
   if (ms === null || ms === undefined) return "—";
   const sign = ms < 0 ? "-" : "";
   const t = Math.abs(ms);
-  const m = Math.floor(t / 60000);
-  const s = Math.floor((t % 60000) / 1000);
-  return `${sign}${m}:${String(s).padStart(2, "0")}.${String(t % 1000).padStart(3, "0")}`;
+  const pad = (v, n = 2) => String(v).padStart(n, "0");
+  return `${sign}${pad(Math.floor(t / 3600000))}:${pad(Math.floor(t / 60000) % 60)}:` +
+    `${pad(Math.floor(t / 1000) % 60)}.${pad(t % 1000, 3)}`;
 }
 
 /** "google/siglip2-base-patch16-naflex" -> "siglip2-base-patch16-naflex". */
@@ -161,6 +168,58 @@ function truncate(value, max = 30) {
   return s.length > max ? s.slice(0, max) + "…" : s;
 }
 
+/* Fields whose meaning is not self-evident. Wording follows
+   model-frame-vector's README so the two cannot drift apart. */
+const FIELD_HELP = {
+  score: "Detector confidence for this detection, 0–1. Detections only.",
+  upscale:
+    "The NaFlex scale actually applied to reach the patch budget. Below 1 the " +
+    "image was downsampled (a whole frame); above 1 it was upsampled (a crop), " +
+    "so a large value marks a heavily interpolated, low-detail input.",
+};
+
+/** A hoverable "?" carrying one field's explanation.
+ *
+ * The text rides in `data-help` and is drawn by CSS rather than left to the
+ * browser's native `title` tooltip, which did not appear here and cannot be
+ * styled or positioned when it does. `tabindex` so it is reachable without a
+ * mouse, and `aria-label` so the text is available to a screen reader, which
+ * cannot see a `::after`.
+ */
+function fieldHelp(key) {
+  const text = FIELD_HELP[key];
+  if (!text) return "";
+  const escaped = escapeHtml(text);
+  // A real child rather than a ::after, so `wireFieldHelp` can measure it and
+  // decide which way it should open.
+  return ` <span class="field-help" tabindex="0" role="note" aria-label="${escaped}">?` +
+    `<span class="bubble">${escaped}</span></span>`;
+}
+
+/** Open each help bubble in whichever direction it fits.
+ *
+ * Below the icon by default, but the last rows of the panel have no room there
+ * and the panel clips rather than spills (`overflow-y: auto` computes
+ * overflow-x to auto too), so the bubble would lose its bottom edge. Measured
+ * per hover rather than once, because the panel scrolls.
+ */
+function wireFieldHelp(root) {
+  const panel = root.closest("#detail") || root;
+  for (const icon of root.querySelectorAll(".field-help")) {
+    const place = () => {
+      const bubble = icon.querySelector(".bubble");
+      if (!bubble) return;
+      icon.classList.remove("flip-up");
+      const room = panel.getBoundingClientRect().bottom - icon.getBoundingClientRect().bottom;
+      // +12 so the bubble keeps a margin from the panel edge rather than
+      // sitting flush against it.
+      if (room < bubble.offsetHeight + 12) icon.classList.add("flip-up");
+    };
+    icon.addEventListener("mouseenter", place);
+    icon.addEventListener("focus", place);
+  }
+}
+
 /** The metadata rows worth showing, in a stable order, formatted for reading. */
 function metaRows(meta, { full = false } = {}) {
   const rows = [];
@@ -169,21 +228,36 @@ function metaRows(meta, { full = false } = {}) {
   push("id", meta.id);
   push("qid", full ? meta.qid : truncate(meta.qid, 22));
   push("track", meta.track);
-  if (meta.frame_idx !== null && meta.frame_idx !== undefined) push("frame", meta.frame_idx);
 
-  // A frame is an instant, so its start and end are equal; collapse them into
-  // one row rather than showing the same number twice.
-  if (meta.start_time === meta.end_time) {
+  // A frame is an instant, so it reads as one timecode; a segment reads as an
+  // interval. This is also the frame_vectors/face_vectors vs video_vectors
+  // split, without having to know which index it came from.
+  if (meta.frame_idx !== null && meta.frame_idx !== undefined) {
+    push("frame", meta.frame_idx);
     push("time", formatTime(meta.start_time));
-  } else {
+  } else if (meta.end_time > meta.start_time) {
     push("start", formatTime(meta.start_time));
     push("end", formatTime(meta.end_time));
+  } else {
+    push("time", formatTime(meta.start_time));
   }
-  push("source", full ? meta.source : truncate(meta.source, 22));
-  if (full) push("batch", meta.batch_id);
-  // Everything the tagger stamped, so the recipe is inspectable rather than
-  // having to be inferred from behaviour.
-  if (full && meta.additional_info && Object.keys(meta.additional_info).length) {
+  return rows;
+}
+
+/** Everything else a row carries: provenance, and whatever the tagger stamped.
+ *
+ * Split out rather than listed with the rest because it is reference material —
+ * useful when something looks wrong, noise the other 95% of the time. A
+ * detection row can stamp eight `additional_info` keys, which buries the three
+ * fields that identify the vector.
+ */
+function extraRows(meta) {
+  const rows = [];
+  const push = (k, v) => { if (v !== null && v !== undefined && v !== "") rows.push([k, v]); };
+
+  push("source", meta.source);
+  push("batch", meta.batch_id);
+  if (meta.additional_info && typeof meta.additional_info === "object") {
     for (const [k, v] of Object.entries(meta.additional_info)) {
       // A box reads as four numbers, not as JSON punctuation.
       if (k === "box" && v && typeof v === "object") {
@@ -195,6 +269,19 @@ function metaRows(meta, { full = false } = {}) {
     }
   }
   return rows;
+}
+
+/** The collapsed "View more metadata" block, or "" when there is nothing more. */
+function extraMetadata(meta) {
+  const rows = extraRows(meta);
+  if (!rows.length) return "";
+  return `
+    <details class="more-meta">
+      <summary>View more metadata</summary>
+      <dl>${rows
+        .map(([k, v]) => `<dt>${escapeHtml(k)}${fieldHelp(k)}</dt><dd>${v}</dd>`)
+        .join("")}</dl>
+    </details>`;
 }
 
 function dl(rows) {
@@ -805,13 +892,15 @@ function select(point, fromQuery = null) {
     <h2><span class="dot" style="background:${cssVar(mod.css)}"></span>${mod.label} vector</h2>
     <div id="detail-media">${mediaSkeleton(point)}</div>
     <div class="section">Metadata</div>
-    ${dl(metaRows(meta, { full: true }))}`;
+    ${dl(metaRows(meta, { full: true }))}
+    ${extraMetadata(meta)}`;
   $("detail").hidden = false;
   render();
 
   if (back) {
     $("detail-back").addEventListener("click", () => selectQuery(back));
   }
+  wireFieldHelp($("detail-body"));
   wireUnlock(point);
   loadMedia(point);
 }
@@ -882,6 +971,49 @@ function wireUnlock(point) {
   $("content-token-go").addEventListener("click", submit);
   input.addEventListener("keydown", (e) => e.key === "Enter" && submit());
   input.focus();
+}
+
+/** Open the selected media large, over the whole stage.
+ *
+ * A 320px-wide panel is enough to confirm *which* frame this is and no more.
+ * The overlay reuses the same URL, so nothing is refetched, and the clip keeps
+ * its own in/out points rather than becoming a different piece of media.
+ */
+function expandMedia(point, url) {
+  const meta = point.meta;
+  const isVideo = point.modality === "video";
+  const box = isVideo ? null : detectionBox(meta);
+
+  const overlay = document.createElement("div");
+  overlay.id = "media-full";
+  overlay.innerHTML = `
+    <button class="close" title="Close (Esc)" aria-label="Close">×</button>
+    <figure>
+      ${isVideo
+        ? `<video id="full-clip" controls playsinline autoplay></video>`
+        : `<div class="frame"><img src="${url}" alt="">${box ? boxOverlay(box, meta.tag) : ""}</div>`}
+      <figcaption>${isVideo
+        ? clipRange(meta)
+        : `Frame ${meta.frame_idx} @ ${formatTime(meta.start_time)}`}</figcaption>
+    </figure>`;
+  document.getElementById("stage").appendChild(overlay);
+
+  let teardown = null;
+  const close = () => {
+    if (teardown) teardown();
+    document.removeEventListener("keydown", onKey);
+    overlay.remove();
+  };
+  const onKey = (e) => e.key === "Escape" && close();
+  document.addEventListener("keydown", onKey);
+  overlay.querySelector(".close").addEventListener("click", close);
+  // Clicking the backdrop closes; clicking the media itself must not, or the
+  // video controls would dismiss the overlay instead of seeking.
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
+
+  if (isVideo) {
+    teardown = playClip(overlay.querySelector("#full-clip"), url, meta.start_time, meta.end_time);
+  }
 }
 
 /** Why a row could not be classified, in terms of the field that is wrong.
@@ -984,6 +1116,9 @@ async function loadMedia(point) {
       const img = host.querySelector("img");
       const frame = host.querySelector(".frame");
       img.addEventListener("load", () => frame.classList.remove("is-loading"), { once: true });
+      frame.classList.add("expandable");
+      frame.title = "Click to view larger";
+      frame.addEventListener("click", () => expandMedia(point, url));
       img.addEventListener("error", () =>
         mediaFailed(host, "The fabric refused this frame."));
       return;
@@ -1002,11 +1137,15 @@ async function loadMedia(point) {
       </div>
       <p class="caption">
         ${clipRange(meta)}
+        <button id="clip-expand">Expand</button>
         <button id="clip-replay">Replay</button>
       </p>`;
 
     const video = $("clip");
     const wrap = host.querySelector(".frame");
+    // Buttons rather than a click on the player: a click on the video itself
+    // belongs to its own controls.
+    $("clip-expand").addEventListener("click", () => expandMedia(point, url));
     // loadeddata, not loadedmetadata: metadata arrives before any pixels do.
     video.addEventListener("loadeddata", () => wrap.classList.remove("is-loading"));
     const attach = () => {
