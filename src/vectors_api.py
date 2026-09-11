@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import logging
 import random
-from bisect import bisect_right
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import requests
@@ -221,21 +220,13 @@ def count_windows(
     auth_token: str,
     probe: Sequence[float],
     sources: Optional[List[str]] = None,
-) -> Tuple[List[Tuple[int, int, int]], Dict[str, List[int]]]:
+) -> List[Tuple[int, int, int]]:
     """Partition the timeline into windows of at most WINDOW_LIMIT rows.
 
-    Returns (start_time_gte, start_time_lte, row_count) per non-empty window,
-    plus every row's start_time grouped by content qid. Runs without vectors, so
-    the whole index costs ~150 B/row to walk.
-
-    The start times are collected here, and not later, because this pass sees the
-    whole index while the fetch that follows sees only the sample. Deriving
-    shot bounds from the sample would stretch a shot across whatever its
-    neighbours' rows the sampling happened to drop; deriving them here means a
-    sampled row still carries the bound it has in the full index.
+    Returns (start_time_gte, start_time_lte, row_count) per non-empty window.
+    Runs without vectors, so the whole index costs ~150 B/row to walk.
     """
     windows: List[Tuple[int, int, int]] = []
-    starts_by_qid: Dict[str, List[int]] = {}
     # Explicit stack rather than recursion: the bisection can go ~40 deep.
     pending = [(0, MAX_START_TIME_MS)]
 
@@ -263,82 +254,8 @@ def count_windows(
             logger.warning(f"window [{lo}, {hi}] is saturated, rows beyond {WINDOW_LIMIT} are invisible")
         windows.append((lo, hi, len(rows)))
 
-        for row in rows:
-            entry = row.get("vector") or {}
-            # Frames and text are instants, not segments; including them would
-            # invent an interval for a row that never had one.
-            if entry.get("frame_idx") is not None or (entry.get("text") or "").strip():
-                continue
-            start = entry.get("start_time")
-            if start is None:
-                continue
-            starts_by_qid.setdefault(entry.get("qid") or "", []).append(int(start))
-
     windows.sort()
-    for starts in starts_by_qid.values():
-        starts.sort()
-    return windows, starts_by_qid
-
-
-def derive_segment_ends(
-    metadata: List[Dict[str, Any]], starts_by_qid: Dict[str, List[int]]
-) -> int:
-    """Fill in `derived_end_time` for segment rows whose own end is unusable.
-
-    Why the end is missing
-    ----------------------
-    A tag-aligned tagger is handed one segment at a time as its whole input, so
-    within that clip it sees a single window and stamps the "whole of this media"
-    sentinel start == end == 0. The pipeline then re-bases the row into the parent
-    timeline, shifting both fields by the segment's offset and leaving
-    start == end == segment start -- a row that reads as "whole video" and plays
-    to the end of the file instead of stopping at its own segment.
-
-    Model-side windowing never lands here: a tagger that splits by
-    `segment_length_s` sees several windows and stamps real bounds, so `end_time`
-    is already right and nothing below fires.
-
-    What is assumed
-    ---------------
-    Segments tile the timeline contiguously and do not overlap --
-    true of shot alignment and of fixed-length clip alignment alike, which is why
-    this keys off neighbouring starts rather than anything shot-specific. The next
-    segment's start is this segment's end, so for tiling input this
-    reconstructs the alignment track's bounds rather than approximating them.
-
-    The last segment of each object has no successor and is left open, which
-    plays it to the end of the video -- right for a final segment.
-
-    Written to `derived_end_time`, never over `end_time`: the row keeps saying
-    what the tagger actually recorded, so a reconstructed bound can be labelled
-    as reconstructed.
-    """
-    # An object is segmented if its rows sit at more than one start time. That is
-    # what distinguishes a re-based segment from a genuine whole-media vector,
-    # both of which carry start == end.
-    segmented_qids = {qid for qid, starts in starts_by_qid.items() if len(set(starts)) > 1}
-
-    filled = 0
-    for meta in metadata:
-        start, end = meta.get("start_time"), meta.get("end_time")
-        if start is None or (end is not None and end > start):
-            continue   # a real interval; nothing to derive
-        if meta.get("frame_idx") is not None or (meta.get("text") or "").strip():
-            continue
-        qid = meta.get("qid") or ""
-        if qid not in segmented_qids:
-            continue   # a lone vector for this object: not a segment
-        # Marked even when the end cannot be derived, because *being a segment*
-        # is what the modality test needs; the final segment of each object has
-        # no successor and keeps an open end.
-        meta["segmented"] = True
-        starts = starts_by_qid.get(qid) or []
-        nxt = bisect_right(starts, int(start))
-        if nxt >= len(starts):
-            continue   # last segment of this object: leave open
-        meta["derived_end_time"] = starts[nxt]
-        filled += 1
-    return filled
+    return windows
 
 
 def _quotas(counts: Sequence[int], sample_size: int) -> List[int]:
@@ -383,12 +300,7 @@ def get_vectors(
         logger.info(f"Tracks: {track_counts} (total {sum(track_counts.values())})")
 
     logger.info("Counting rows per window (no vectors)...")
-    # windows = count_windows(index_qid, auth_token, _random_probe(vector_size, rng), sources)
-    # Also returns every row's start_time, which is what segment ends are derived
-    # from -- collected here because this pass sees the whole index, not the sample.
-    windows, starts_by_qid = count_windows(
-        index_qid, auth_token, _random_probe(vector_size, rng), sources
-    )
+    windows = count_windows(index_qid, auth_token, _random_probe(vector_size, rng), sources)
     population = sum(count for _, _, count in windows)
     if population == 0:
         return [], []
@@ -422,9 +334,6 @@ def get_vectors(
 
     logger.info(f"Retrieved {len(vectors)} of {population} vectors from index `{index_qid}`")
 
-    filled = derive_segment_ends(metadata, starts_by_qid)
-    if filled:
-        logger.info(f"Derived an end time for {filled} segment rows that carried none")
     return vectors, metadata
 
 
@@ -435,17 +344,11 @@ def modality(meta: Dict[str, Any]) -> str:
     not an interval), so the video test has to be a strict inequality and has to
     run after the frame_idx test -- otherwise every frame reads as a video.
 
-    The two segment fields are part of the same test, not an extra rule, and they
-    only matter for rows tagged before the tagger began stamping a real duration
-    on a whole-media vector. Those reach here with start == end: the tagger
-    stamped the "whole of this media" sentinel for the one segment it was handed
-    and the pipeline re-based both fields together. `derive_segment_ends`
-    recovers the interval, so an unsegmented row is still `unknown` and only a
-    row shown to be a segment reads as video -- without it a shot-aligned index
-    tagged that way plots entirely as `unknown` and loses its player.
-
-    Re-tagged rows carry end > start and match on the plain rule above, so this
-    goes dormant on its own rather than needing to be removed.
+    A row whose end_time is missing or not greater than start_time is `unknown`,
+    including a segment written before whole-media tags carried a real duration
+    (those re-based the "whole of this media" sentinel into start == end). Such a
+    row describes no extent, so rather than reconstructing one it is reported as
+    what it is -- the detail panel names the defective field.
     """
     if (meta.get("text") or "").strip():
         return "text"
@@ -453,8 +356,6 @@ def modality(meta: Dict[str, Any]) -> str:
         return "image"
     start, end = meta.get("start_time"), meta.get("end_time")
     if start is not None and end is not None and end > start:
-        return "video"
-    if meta.get("segmented") or (meta.get("derived_end_time") or 0) > (start or 0):
         return "video"
     return "unknown"
 

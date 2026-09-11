@@ -172,16 +172,12 @@ function metaRows(meta, { full = false } = {}) {
   if (meta.frame_idx !== null && meta.frame_idx !== undefined) push("frame", meta.frame_idx);
 
   // A frame is an instant, so its start and end are equal; collapse them into
-  // one row rather than showing the same number twice. A tag-aligned segment
-  // also arrives with start == end, but is an interval — show the derived bound
-  // rather than reporting it as an instant.
-  if (meta.start_time === meta.end_time && !(meta.derived_end_time > meta.start_time)) {
+  // one row rather than showing the same number twice.
+  if (meta.start_time === meta.end_time) {
     push("time", formatTime(meta.start_time));
   } else {
     push("start", formatTime(meta.start_time));
-    push("end", meta.end_time > meta.start_time
-      ? formatTime(meta.end_time)
-      : `${formatTime(meta.derived_end_time)} (derived)`);
+    push("end", formatTime(meta.end_time));
   }
   push("source", full ? meta.source : truncate(meta.source, 22));
   if (full) push("batch", meta.batch_id);
@@ -908,9 +904,9 @@ function unknownReason(meta) {
     return `This vector's <b>end_time</b> ${same ? "equals" : "precedes"} its
       <b>start_time</b> (${formatTime(meta.start_time)}), so it describes no
       extent.<br><small>Whole-media tags once carried
-      <code>start == end == 0</code> as a sentinel; a segment that reaches here
-      was written before that was fixed and has no sibling segments to derive an
-      end from. Showing metadata only.</small>`;
+      <code>start == end == 0</code> as a sentinel, which the pipeline re-based
+      into both fields; a row like this was written before that was fixed and
+      needs re-tagging. Showing metadata only.</small>`;
   }
   return `No recognisable media fields.<br><small>No text, no frame index and no
     time range, so there is nothing to fetch. Showing metadata only.</small>`;
@@ -948,36 +944,14 @@ function boxOverlay(box, label) {
 
 /** How a clip's extent reads.
  *
- * A row with no usable out point plays to the end of the file, so it must not be
- * labelled `0:00.000 – 0:00.000` — that would claim a zero-length clip while the
- * whole video runs. Two different rows land there, and they are not the same
- * thing: the **last** segment of an object, which has no successor to derive an
- * end from, and a whole-media vector tagged before the taggers began stamping a
- * real duration. Calling the final shot of a video "Whole video" would be wrong.
+ * A row only reaches here as `video`, which requires end_time > start_time, so
+ * the extent is always real. Rows without one are `unknown` and never get a
+ * player — see `unknownReason`.
  */
 function clipRange(meta) {
-  const end = segmentEnd(meta);
-  if (end === null) {
-    return meta.segmented
-      ? `Final segment from ${formatTime(meta.start_time)} — plays to end`
-      : "Whole video";
-  }
-  const suffix = meta.end_time > meta.start_time ? "" : " (derived)";
-  return `Clip ${formatTime(meta.start_time)} – ${formatTime(end)}${suffix}`;
+  return `Clip ${formatTime(meta.start_time)} – ${formatTime(meta.end_time)}`;
 }
 
-/** The out point to play to, or null to run to the end of the video.
- *
- * Prefers what the tagger recorded, which since 2026-09-10 is a real duration
- * even for a whole-media vector. `derived_end_time` is the reconstruction the
- * service makes for rows tagged before that, whose end is the re-based
- * start == end sentinel rather than a real bound — see `derive_segment_ends`.
- */
-function segmentEnd(meta) {
-  if (meta.end_time > meta.start_time) return meta.end_time;
-  if (meta.derived_end_time > meta.start_time) return meta.derived_end_time;
-  return null;
-}
 
 /** Fetch the frame or the clip and swap it into the open panel. */
 async function loadMedia(point) {
@@ -1038,8 +1012,7 @@ async function loadMedia(point) {
     const attach = () => {
       wrap.classList.add("is-loading");
       teardownMedia();
-      // state.mediaTeardown = playClip(video, url, meta.start_time, meta.end_time);
-      state.mediaTeardown = playClip(video, url, meta.start_time, segmentEnd(meta));
+      state.mediaTeardown = playClip(video, url, meta.start_time, meta.end_time);
     };
     $("clip-replay").addEventListener("click", attach);
     attach();

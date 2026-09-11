@@ -134,11 +134,12 @@ precise than `rep/frame`. `ignore_trimming=true` matters there: without it the
 frame is addressed against the trimmed timeline, not the one taggers record
 timestamps against.
 
-**Clips play their own segment**, seeking to `start_time` and pausing at the
-end. Rows whose `end_time` is unusable get one reconstructed from the next
-segment's start (`derive_segment_ends`), labelled `(derived)`; that exists for
-rows tagged before whole-media tags carried a real duration, and goes dormant on
-its own once an index is re-tagged.
+**Clips play their own segment**, seeking to `start_time` and pausing at
+`end_time`. A row needs `end_time > start_time` to be a video at all; one
+without it describes no extent and is reported as such in the detail panel
+rather than guessed at. That happens to rows written before whole-media tags
+carried a real duration — the pipeline re-based a `start == end == 0` sentinel
+into both fields — and the fix is to re-tag.
 
 ---
 
