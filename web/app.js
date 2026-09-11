@@ -58,6 +58,7 @@ const state = {
   hovered: null,
   selected: null,
   selectedQuery: null,   // the detail panel shows a point or a query, never both
+  cameFrom: null,        // the query a selected point was reached from, for "back"
   // Queries accumulate rather than replacing each other: comparing where two
   // searches land in one space is the point of plotting them at all.
   // Each: {id, n, x, y, mode, label, neighbours, pinned, linksVisible, alpha,
@@ -322,8 +323,10 @@ function buildLayers() {
           from: [q.x, q.y],
           to: [row.p.x, row.p.y],
           color: [...rgb, Math.round((70 + 185 * k) * q.alpha)],
-          // Carried so a click on the link can open the node it points at.
+          // Carried so a click on the link can open the node it points at, and
+          // so the node's panel can offer a way back to this query.
           point: row.p,
+          query: q,
           pinned: q.pinned,
         });
       }
@@ -373,7 +376,8 @@ function buildLayers() {
                 render();
               }
             },
-            onClick: (info) => (info.object ? select(info.object.point) : null),
+            onClick: (info) =>
+              (info.object ? select(info.object.point, info.object.query) : null),
           })
         );
       }
@@ -475,6 +479,9 @@ function togglePin(q) {
   q.pinned = !q.pinned;
   q.pinned ? holdLinks(q) : fadeLinks(q);
   drawLegend();
+  // The open node panel's back button is derived from what is pinned, so it has
+  // to be rebuilt when that changes.
+  if (state.selected) select(state.selected, state.cameFrom);
 }
 
 /** Stop a query's timers and release the blob URL holding its uploaded file. */
@@ -659,6 +666,7 @@ function showTip(html, info) {
 function selectQuery(q) {
   state.selected = null;
   state.selectedQuery = q;
+  state.cameFrom = null;
   $("search-panel").hidden = true;
   teardownMedia();
 
@@ -742,9 +750,21 @@ function wireNeighbourList(q) {
     row.addEventListener("mouseleave", () => { state.hovered = null; render(); });
     row.addEventListener("click", () => {
       centreOn(point);
-      select(point);
+      select(point, q);
     });
   }
+}
+
+/** The pinned query whose neighbours include this point, or null.
+ *
+ * `preferred` wins when it qualifies, so arriving from one of several pinned
+ * queries goes back to that one rather than to whichever is first.
+ */
+function pinnedQueryFor(point, preferred = null) {
+  const links = (q) =>
+    q && q.pinned && (q.neighbours || []).some((n) => n.index === point.i);
+  if (links(preferred)) return preferred;
+  return state.queries.find(links) || null;
 }
 
 /** Pan to a point, keeping the zoom, so a click on a row goes to it. */
@@ -768,7 +788,7 @@ function queryMediaHtml(q) {
   return `${media}<p class="caption">${escapeHtml(truncate(q.label || "", 40))}</p>`;
 }
 
-function select(point) {
+function select(point, fromQuery = null) {
   state.selected = point;
   state.selectedQuery = null;
   $("search-panel").hidden = true;
@@ -776,8 +796,16 @@ function select(point) {
 
   const mod = MODALITY[point.modality] || MODALITY.unknown;
   const meta = point.meta;
+  // Shown whenever a *pinned* query links to this node, not only when the node
+  // was opened through one. Keyed on how the node was reached, two neighbours
+  // of the same pinned query would disagree — one clicked from the list has a
+  // way back, the same node clicked on the map does not — which reads as a bug.
+  const back = pinnedQueryFor(point, fromQuery);
+  state.cameFrom = back;
 
   $("detail-body").innerHTML = `
+    ${back ? `<button id="detail-back" class="back">← Query ${back.n} ·
+        ${MODALITY[back.mode]?.label || back.mode}</button>` : ""}
     <h2><span class="dot" style="background:${cssVar(mod.css)}"></span>${mod.label} vector</h2>
     <div id="detail-media">${mediaSkeleton(point)}</div>
     <div class="section">Metadata</div>
@@ -785,6 +813,9 @@ function select(point) {
   $("detail").hidden = false;
   render();
 
+  if (back) {
+    $("detail-back").addEventListener("click", () => selectQuery(back));
+  }
   wireUnlock(point);
   loadMedia(point);
 }
@@ -965,14 +996,21 @@ async function loadMedia(point) {
       if (token !== state.mediaToken) return;
       if (!url) return mediaFailed(host, "This object has no video offering.");
       const box = detectionBox(meta);
+      // `is-loading` holds the spinner in the space the frame will occupy.
+      // Having the URL is not having the image: the fabric still has to send
+      // it, and without this the panel goes blank for those seconds.
       host.innerHTML = `
-        <div class="frame">
+        <div class="frame is-loading">
           <img alt="Frame ${meta.frame_idx}" src="${url}">
           ${box ? boxOverlay(box, meta.tag) : ""}
+          <div class="media-spinner"><span class="spinner"></span></div>
         </div>
         <p class="caption">Frame ${meta.frame_idx} @ ${formatTime(meta.start_time)}${
           box ? " — box shown" : ""}</p>`;
-      host.querySelector("img").addEventListener("error", () =>
+      const img = host.querySelector("img");
+      const frame = host.querySelector(".frame");
+      img.addEventListener("load", () => frame.classList.remove("is-loading"), { once: true });
+      img.addEventListener("error", () =>
         mediaFailed(host, "The fabric refused this frame."));
       return;
     }
@@ -981,15 +1019,24 @@ async function loadMedia(point) {
     if (token !== state.mediaToken) return;
     if (!url) return mediaFailed(host, "This object has no playable offering.");
 
+    // Same reservation as the frame: a manifest still has to be fetched and
+    // parsed before the first frame paints.
     host.innerHTML = `
-      <video id="clip" controls playsinline></video>
+      <div class="frame is-loading">
+        <video id="clip" controls playsinline></video>
+        <div class="media-spinner"><span class="spinner"></span></div>
+      </div>
       <p class="caption">
         ${clipRange(meta)}
         <button id="clip-replay">Replay</button>
       </p>`;
 
     const video = $("clip");
+    const wrap = host.querySelector(".frame");
+    // loadeddata, not loadedmetadata: metadata arrives before any pixels do.
+    video.addEventListener("loadeddata", () => wrap.classList.remove("is-loading"));
     const attach = () => {
+      wrap.classList.add("is-loading");
       teardownMedia();
       // state.mediaTeardown = playClip(video, url, meta.start_time, meta.end_time);
       state.mediaTeardown = playClip(video, url, meta.start_time, segmentEnd(meta));

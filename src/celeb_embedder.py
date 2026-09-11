@@ -316,19 +316,22 @@ class CelebQueryEmbedder:
         if proc is not None and proc.poll() is None:
             return proc
 
-        tagger = _tagger_path()
-        if tagger is None:
-            raise EmbeddingError(
-                "celeb query embedding needs model-celeb-vector importable. Point "
-                f"CELEB_EMBEDDING_PATH at it. Looked in: {', '.join(_celeb_search_paths())}"
-            )
+        # Checkout paths are optional. tools/setup_celeb_env.sh pip-installs
+        # celeb_vector, celeb and common_ml into the environment, so the worker
+        # usually imports them with no help; these only matter when running
+        # against a checkout instead (local development, or the tagger's own
+        # container). The worker puts on sys.path whichever of them is set.
         env = {
             **os.environ,
-            "CELEB_EMBEDDING_PATH": tagger,
-            "COMMON_ML_PATH": _common_ml_path(),
             "CELEB_MODEL_PATH": _weights_path(),
             "CELEB_PARAMS": json.dumps(self.params or {}),
         }
+        tagger = _tagger_path()
+        if tagger:
+            env["CELEB_EMBEDDING_PATH"] = tagger
+        common_ml = _common_ml_path()
+        if common_ml and Path(common_ml, "common_ml").is_dir():
+            env["COMMON_ML_PATH"] = common_ml
         logger.info(f"starting celeb worker: {python} (weights {_weights_path()})")
         proc = subprocess.Popen(
             [str(python), str(CELEB_WORKER)],

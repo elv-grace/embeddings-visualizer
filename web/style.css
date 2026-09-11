@@ -340,6 +340,22 @@ button.help:hover { color: var(--text); border-color: var(--accent); }
 /* Detection box drawn over the frame. Positioned in percentages so it tracks
    the image at any panel width — the stored box is normalized, not in pixels. */
 #detail .frame { position: relative; line-height: 0; }
+
+/* Holds the media's place while the fabric sends it. Having the URL is not
+   having the pixels, and without a reserved box the panel goes blank for those
+   seconds and then jumps when the image lands. */
+#detail .frame.is-loading {
+  min-height: 150px;
+  background: var(--panel-2);
+  border-radius: 6px;
+}
+/* Hidden rather than absent: the element has to be in the layout for the
+   browser to start fetching it, and for `load` to fire. */
+#detail .frame.is-loading img,
+#detail .frame.is-loading video,
+#detail .frame.is-loading .det-box { visibility: hidden; }
+#detail .media-spinner { position: absolute; inset: 0; display: grid; place-items: center; }
+#detail .frame:not(.is-loading) .media-spinner { display: none; }
 #detail .det-box {
   position: absolute;
   border: 2px solid var(--m-query);
@@ -370,6 +386,16 @@ button.help:hover { color: var(--text); border-color: var(--accent); }
   margin: 8px 0 0; color: var(--muted); font-variant-numeric: tabular-nums;
 }
 #detail .caption button { margin-left: auto; padding: 3px 9px; font-size: 12px; }
+
+/* Back to the query a neighbour was opened from. Full width and above the
+   heading, so it reads as "where you came from" rather than as an action on
+   this vector. */
+#detail .back {
+  display: block; width: 100%; margin: 0 0 10px;
+  text-align: left; font-size: 12px; color: var(--muted);
+  background: none; border: 1px solid var(--line);
+}
+#detail .back:hover { color: var(--text); border-color: var(--accent-dim); }
 
 /* Ranked neighbours of a query. A list because a dense cluster makes the map
    useless for "which node is the third best match" — see neighbourList(). */

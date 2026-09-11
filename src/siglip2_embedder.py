@@ -31,12 +31,16 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, IO, Optional
 
+import logging
+
 import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
 
 from embedder import EmbeddingError, decode_image, pad_vector
+
+logger = logging.getLogger(__name__)
 
 # Must match what the index was tagged with.
 DEFAULT_MODEL_ID = "google/siglip2-base-patch16-naflex"
@@ -76,11 +80,14 @@ def _load_tagger_extractor():
     Substituting it for model-vector's `FeatureExtractor` is safe because the two
     compute the same thing for a whole image: `Siglip2ImageProcessor` at a patch
     budget, `Siglip2VisionModel(...).pooler_output.float()`, then an optional
-    `F.normalize`. Its extra lever is `max_upscale`, which shrinks the budget for
-    small *crops*; left at its default of None every input gets the full
-    `max_num_patches`, which is the fixed budget the frame tagger always used.
-    Its defaults match this module's constants exactly (256 patches, normalize
-    on), so a query embeds into the same space as before.
+    `F.normalize`.
+
+    Returns `(Siglip2CropEmbedder, module)`. The module is needed for its
+    constants: as of model-frame-vector v3 the patch budget and normalize are
+    FIXED there (`MAX_NUM_PATCHES`, `NORMALIZE`) rather than passed per call,
+    because each was measured into its value and a caller changing one silently
+    produces vectors that are not comparable with the index. `max_upscale` is
+    gone entirely.
     """
     paths = [os.environ["SIGLIP_EMBEDDING_PATH"]] if os.environ.get("SIGLIP_EMBEDDING_PATH") else []
     paths += list(SIGLIP_PATH_CANDIDATES)
@@ -91,10 +98,10 @@ def _load_tagger_extractor():
             if path not in sys.path:
                 sys.path.insert(0, path)
         try:
-            from general_detection.config import RuntimeConfig
+            from general_detection import embedder as tagger_embedder
             from general_detection.embedder import Siglip2CropEmbedder
 
-            return Siglip2CropEmbedder, RuntimeConfig
+            return Siglip2CropEmbedder, tagger_embedder
         except ImportError:
             continue
     return None
@@ -129,21 +136,32 @@ class Siglip2ImageEmbedder:
 
         tagger = _load_tagger_extractor()
         if tagger is not None:
-            Siglip2CropEmbedder, RuntimeConfig = tagger
-            # max_upscale stays None: a query is a whole image, so it gets the
-            # full patch budget, which is what the frame tagger always used.
-            self._cfg = RuntimeConfig(normalize=normalize, max_num_patches=max_num_patches)
-            self._extractor = Siglip2CropEmbedder(
-                model_id=model_id, revision=revision, dtype=dtype
-            )
-            self.processor = self._extractor.processor
-            self.model = self._extractor.model
-            return
+            Siglip2CropEmbedder, tagger_embedder = tagger
+            # The tagger fixes these; it cannot be asked for different ones. When
+            # the index was built with different values -- an older tagger, whose
+            # stamped `additional_info` says so -- its own tower would embed the
+            # query under today's constants instead, quietly putting it in a
+            # different space. The local tower below honours any values and is
+            # numerically identical, so that case falls through to it.
+            fixed_patches = getattr(tagger_embedder, "MAX_NUM_PATCHES", max_num_patches)
+            fixed_normalize = getattr(tagger_embedder, "NORMALIZE", normalize)
+            if (fixed_patches, fixed_normalize) != (max_num_patches, normalize):
+                logger.warning(
+                    f"index wants max_num_patches={max_num_patches}, normalize={normalize}; "
+                    f"the tagger fixes {fixed_patches}/{fixed_normalize}. Using the local "
+                    "tower so the query matches the index."
+                )
+            else:
+                self._extractor = Siglip2CropEmbedder(
+                    model_id=model_id, revision=revision, dtype=dtype
+                )
+                self.processor = self._extractor.processor
+                self.model = self._extractor.model
+                return
 
         from transformers import Siglip2ImageProcessor, Siglip2VisionModel
 
         self._extractor = None
-        self._cfg = None
         # Vision tower only; transformers logs the checkpoint's text-tower keys as
         # UNEXPECTED, which is the discarded half and is expected.
         self.processor = Siglip2ImageProcessor.from_pretrained(model_id, revision=revision)
@@ -154,10 +172,12 @@ class Siglip2ImageEmbedder:
 
     def embed_image(self, img: np.ndarray) -> np.ndarray:
         if self._extractor is not None:
-            # embed() is batched and also returns per-crop upscale factors, which
-            # are a tagging-side diagnostic; one image in, one vector out.
-            # return self._extractor._embed_frame(img)
-            vectors, _upscales = self._extractor.embed([img], self._cfg)
+            # embed() is batched and also returns per-image scale factors, which
+            # are a tagging-side diagnostic; one image in, one vector out. It
+            # took a RuntimeConfig before model-frame-vector v3 made the budget
+            # a fixed constant.
+            # vectors, _upscales = self._extractor.embed([img], self._cfg)
+            vectors, _scales = self._extractor.embed([img])
             return vectors[0]
 
         inputs = self._preprocess(img)

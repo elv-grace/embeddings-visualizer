@@ -55,66 +55,62 @@ uv pip install --python "$PY" \
   "loguru" \
   --extra-index-url https://download.pytorch.org/whl/cpu
 
-# The tagger's source, if it is not already beside this repo.
+# The tagger's own source, installed rather than copied.
 #
-# Fetched rather than vendored. Three pieces are needed and only two of them are
-# packaged: common-ml and celeb_vector have setup.py, but `celeb` (which holds
-# FaceModel, the InsightFace wrapper) has none -- model-celeb has no setup.py at
-# its root, which is why its own Containerfile COPYs the directory. So a clone is
-# what actually supplies all three.
+# One install brings both packages it needs: since
+# eluv-io/model-celeb@110e446 the vector subdirectory's setup.py declares
+# `packages=['celeb_vector', 'celeb']` with a package_dir mapping `celeb` to
+# ../celeb, so `celeb.face_model` (the InsightFace wrapper) arrives with it.
+# Both repos are readable over https, so no SSH key is needed.
 #
-# Copying those files into this repo would work and is deliberately not done: a
+# Cloned to a temp directory first, rather than `pip install git+https://...`,
+# because model-celeb carries a `buildscripts` submodule pointing at the private
+# qluvio/buildscripts. pip and uv both recurse submodules, so the direct form
+# blocks on a credential prompt for a repo that is not needed to build this
+# package. --no-recurse-submodules avoids it; nothing is left behind afterwards.
+#
+# --no-deps is deliberate. install_requires pins `mxnet-cu101==1.9.1`, a CUDA
+# 10.1 build that is a very large download and buys nothing here: the tagger
+# sets `gpu: -1` and runs InsightFace on CPU on purpose, so the plain `mxnet`
+# installed above is what it actually uses.
+#
+# Copying these files into this repo would work and is deliberately not done: a
 # query has to produce the same vector the tagger produced, and a copy that
-# drifts does not fail, it returns wrong neighbours. A clone stays versioned and
-# updatable.
-#
-# Both repos are private (git@github.com:eluv-io/...), so this needs an SSH key
-# with access -- the same requirement the tagger's own Containerfile has.
-SRC_DIR="$ENV_DIR/src"
-clone_if_missing() {
-  local name="$1" url="$2" probe="$3"
-  if [ -e "$probe" ]; then
-    echo "    $name: already present at $probe"
-    return
-  fi
-  if [ -d "$SRC_DIR/$name" ]; then
-    echo "    $name: already cloned into $SRC_DIR/$name"
-    return
-  fi
-  echo "    $name: not found locally, cloning"
-  mkdir -p "$SRC_DIR"
-  if ! git clone --depth 1 "$url" "$SRC_DIR/$name" 2>&1 | sed 's/^/      /'; then
-    echo "      could not clone $url -- it is private, so this needs an SSH key" >&2
-    echo "      with access. Or place the checkout beside this repo and re-run." >&2
-    return 1
-  fi
+# drifts does not fail, it returns wrong neighbours.
+export GIT_TERMINAL_PROMPT=0    # fail fast instead of blocking on a prompt
+
+SRC="$(mktemp -d)"
+trap 'rm -rf "$SRC"' EXIT
+
+install_from_git() {
+  local name="$1" url="$2" ref="$3" subdir="${4:-}"
+  echo "==> installing $name"
+  git clone --depth 1 --branch "$ref" --no-recurse-submodules -q "$url" "$SRC/$name"
+  uv pip install --python "$PY" --no-deps "$SRC/$name${subdir:+/$subdir}"
 }
 
-echo "==> locating the tagger's source"
-REPO_PARENT="$(dirname "$REPO")"
-clone_if_missing "model-celeb" "git@github.com:eluv-io/model-celeb.git" \
-  "$REPO_PARENT/model-celeb/model-celeb-vector/celeb_vector/model.py" || true
-clone_if_missing "common-ml" "git@github.com:eluv-io/common-ml.git" \
-  "$REPO_PARENT/common-ml/common_ml" || true
+install_from_git model-celeb https://github.com/eluv-io/model-celeb.git \
+  vector-faces model-celeb-vector
+install_from_git common-ml https://github.com/eluv-io/common-ml.git vector-tags
 
 echo "==> verifying"
-"$PY" - <<'PY'
+"$PY" - <<'PYCHECK'
 import sys
 print("  python", sys.version.split()[0])
 import numpy, torch, mxnet
 print("  numpy", numpy.__version__, "| torch", torch.__version__, "| mxnet", mxnet.__version__)
-PY
+from celeb_vector.model import CelebVectorizer   # the import a query actually makes
+print("  celeb_vector + celeb + common_ml import OK")
+PYCHECK
 
 cat <<EOF
 
 Done. The service finds this automatically at $ENV_DIR;
 CELEB_PYTHON overrides the interpreter it uses.
 
-Two things are NOT installed here and must already exist:
-  * model-celeb-vector and common-ml checkouts (CELEB_EMBEDDING_PATH /
-    COMMON_ML_PATH override where they are looked for)
-  * the InsightFace r100 weights. Note config.yml names
-    /ml/models/celeb_detection, but the checkpoint actually lives at
-    /ml/models/celeb (models/model-r100-ii/model-{symbol.json,0000.params}).
-    CELEB_MODEL_PATH overrides it.
+One thing is NOT installed here and must already exist: the InsightFace r100
+weights. Note config.yml names /ml/models/celeb_detection, but the checkpoint
+actually lives at /ml/models/celeb
+(models/model-r100-ii/model-{symbol.json,0000.params}). CELEB_MODEL_PATH
+overrides where they are looked for.
 EOF
