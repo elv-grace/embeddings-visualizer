@@ -1,0 +1,49 @@
+
+container:
+  # docker or podman
+  runtime: podman
+
+  # Arguments added to every container
+  args: []
+  timeout: 900
+  keepalive: 30
+
+  # GPU for any model that names no device of its own.
+  #   0 | [0, 1] | all
+  # Becomes `--device nvidia.com/gpu=N` under podman, `--gpus device=N` under
+  # docker. Inside the container the card is renumbered to 0, so a model asking
+  # for a bare `cuda` lands where it was put. Every container runs on a GPU: a
+  # model with no device here and none of its own is a configuration error.
+  device: 0
+
+# `params:` is the container's --params -- the recipe it embeds under. Stated
+# here, never read off an index, so one model is one container. An index whose
+# rows stamp something different is reported at load, not given its own.
+models:
+
+  default:
+    image: localhost/model-sbert
+    modalities: [text]
+    device: 0
+
+  frame_vectors:
+    image: localhost/model-frame-vector
+    modalities: [text, image]
+    device: 0
+
+  video_vectors:
+    image: localhost/qwen3vl-embedding-video-vector
+    modalities: [text, image, video]
+    device: 2
+    params:
+      prompt: "Represent the user's input."
+      dim: 1024
+      fps: 1
+      max_frames: 64
+      max_length: 8192
+      normalize: true
+
+  face_vectors:
+    image: localhost/celeb-vector
+    modalities: [image]
+    device: 0

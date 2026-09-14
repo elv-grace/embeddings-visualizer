@@ -28,10 +28,13 @@ from flask import Flask, jsonify, request, send_from_directory
 from embedder import (
     EmbeddingError,
     build_embedder_for_model,
-    query_modes_for,
+    modalities_for,
     read_tuning,
+    tuning_mismatch,
+    warm_containers,
 )
 from projection import METHODS, Projector, ProjectionError, anchor_to_neighbours, top_k_similar
+from tagger import status as container_status
 from vectors_api import (
     DEFAULT_SAMPLE_SIZE,
     VectorStoreError,
@@ -43,7 +46,7 @@ from vectors_api import (
 
 logger = logging.getLogger(__name__)
 
-PORT = int(os.environ.get("EV_PORT") or 8099)
+PORT = int(os.environ.get("EV_PORT") or 8079)
 
 # Beside the repo, not in /tmp: a scratch path is wiped between sessions and on
 # reboot, which loses exactly the history worth having. Override with EV_LOG_FILE.
@@ -85,10 +88,16 @@ def configure_logging(path: Path = LOG_FILE) -> Path:
     logging.getLogger("werkzeug").setLevel(logging.INFO)
     return path
 
-# Modes a caller may declare. The index does not record which model built it, so
-# the caller supplies the model and its modes; see embedder.py's docstring.
+# Every modality a query can arrive as. Which of them a given index accepts is
+# not declared by the caller: it follows the model its batches report, and an
+# index whose batches report none falls through to the default container, which
+# is text-only. See embedder.py's docstring.
 ALL_MODES = ("text", "image", "video")
-DEFAULT_MODES = ("text", "image")
+
+# An upload larger than this is refused before it is staged for a container. A
+# query is a photo or a short clip; anything else is a mistake that would
+# otherwise be copied to disk and handed to a model in full.
+MAX_UPLOAD_BYTES = int(os.environ.get("EV_MAX_UPLOAD_MB") or 512) * 1024 * 1024
 
 TOP_K = 10
 
@@ -135,7 +144,15 @@ def create_app(static_dir: str = "../web") -> Flask:
 
     @app.get("/api/health")
     def health():
-        return jsonify({"ok": True, "loaded": list(_indexes)})
+        """What is loaded, and what every tagger container is doing.
+
+        `containers` names each one's log file: a query that fails names the
+        container and quotes the tail of what it printed, and this is where the
+        rest of it is.
+        """
+        return jsonify(
+            {"ok": True, "loaded": list(_indexes), "containers": container_status()}
+        )
 
     @app.post("/api/index")
     def load_index():
@@ -153,7 +170,6 @@ def create_app(static_dir: str = "../web") -> Flask:
         if method not in METHODS:
             return _error(f"unknown method {method!r}, expected one of {list(METHODS)}", 400)
 
-        modes = [m for m in (body.get("modes") or DEFAULT_MODES) if m in ALL_MODES]
         sources = body.get("sources") or None
         sample_size = int(body.get("sample_size") or DEFAULT_SAMPLE_SIZE)
         seed = int(body.get("seed") or 0)
@@ -197,16 +213,34 @@ def create_app(static_dir: str = "../web") -> Flask:
         # lookup per distinct batch, and authorized by the same index token.
         models = batch_models(index_qid, metadata, token)
         model = next(iter(models.values()), None)
+        # Modes follow the model, not anything a vector carries and not anything
+        # the caller asked for. With no model this is the default container's
+        # text, which is the only modality safe to assume of an unidentified
+        # space.
+        modes = modalities_for(model)
         if model:
             logger.info(f"Index model: {model} (from {len(models)} batch(es))")
-            # Modes follow the model, not anything a vector carries.
-            modes = query_modes_for(model) or modes
 
         # additional_info is read for one thing only now: the parameters that
         # tune the tower the batch already chose. It cannot select a model.
         tuning = read_tuning(metadata)
         if tuning:
             logger.info(f"Tuning parameters stamped on the rows: {sorted(tuning)}")
+        # The container runs on the recipe in config.yml, not on this one -- one
+        # model is one container, so the recipe is stated rather than derived.
+        # Where the two disagree the queries are embedded under different
+        # parameters than the index was built with, which does not fail, it just
+        # quietly returns worse neighbours. So it is said out loud, and returned
+        # so the UI can say it too.
+        mismatch = tuning_mismatch(model, tuning)
+        if mismatch:
+            logger.warning(
+                f"index {index_qid} was tagged with "
+                + ", ".join(f"{k}={v['index']!r} (config says {v['configured']!r})"
+                            for k, v in mismatch.items())
+                + f" -- queries will use config.yml's values. Align `params:` for "
+                f"{model!r} or re-tag."
+            )
 
         matrix = np.asarray(vectors, dtype=np.float32)
         projector = Projector(method=method, seed=seed)
@@ -244,9 +278,13 @@ def create_app(static_dir: str = "../web") -> Flask:
                 "count": len(metadata),
                 "vector_size": int(matrix.shape[1]),
                 "tracks": tracks,
-                # Empty when nothing was stamped; the UI then says the model and
-                # modes were declared rather than detected.
+                # Empty when nothing was stamped. When it is not, these are the
+                # container's --params, so the query is embedded under the same
+                # recipe the index was tagged with.
                 "tuning": tuning,
+                # Non-empty when the index's stamped recipe disagrees with the
+                # one its container is configured to run.
+                "tuning_mismatch": mismatch,
                 "bbox": projector.bbox,
                 "explained_variance": projector.explained_variance,
                 "points": _points(coords, metadata),
@@ -270,10 +308,10 @@ def create_app(static_dir: str = "../web") -> Flask:
 
         if loaded.embedder is None:
             width = int(loaded.vectors.shape[1])
-            # The batch's model chooses the tower; the stamped parameters, if
-            # any, only tune it.
+            # The batch's model chooses the container; its recipe is configured
+            # beside it, so every index on this model shares that one container.
             try:
-                loaded.embedder = build_embedder_for_model(loaded.model, width, loaded.tuning)
+                loaded.embedder = build_embedder_for_model(loaded.model, width)
             except EmbeddingError as exc:
                 return _error(str(exc), 422)
 
@@ -285,16 +323,16 @@ def create_app(static_dir: str = "../web") -> Flask:
                 upload = request.files.get("file")
                 if upload is None:
                     return _error("a file upload is required for this mode", 400)
-                if mode == "video":
-                    embed_video = getattr(loaded.embedder, "embed_video", None)
-                    if embed_video is None:
-                        return _error(
-                            f"{loaded.model_id} cannot embed video queries", 422
-                        )
-                    # The filename carries the container suffix the decoder picks by.
-                    vector = embed_video(upload.stream, upload.filename)
-                else:
-                    vector = loaded.embedder.embed_image(upload.stream)
+                data = upload.stream.read(MAX_UPLOAD_BYTES + 1)
+                if len(data) > MAX_UPLOAD_BYTES:
+                    return _error(
+                        f"this {mode} is larger than the "
+                        f"{MAX_UPLOAD_BYTES // (1024 * 1024)} MB query limit; "
+                        "a query is meant to be a still or a short clip",
+                        413,
+                    )
+                # The filename carries the suffix the container's decoder picks by.
+                vector = loaded.embedder.embed_file(mode, data, upload.filename)
         except EmbeddingError as exc:
             return _error(str(exc), 400)
         except Exception as exc:
@@ -391,6 +429,24 @@ def _warm_umap() -> None:
         pass
 
 
+def _warm_containers() -> None:
+    """Bring up the tagger containers, and keep them up.
+
+    In a thread because it starts a container per configured model and an image
+    that has to be pulled can take minutes; the service loads and plots indexes
+    perfectly well while that happens, and only a *query* needs a container.
+    """
+    try:
+        images = warm_containers()
+    except Exception as exc:
+        logger.warning(f"could not warm the tagger containers: {exc}")
+        return
+    logger.info(
+        f"tagger containers running: {', '.join(images)}" if images
+        else "no tagger containers were started; queries will start them on demand"
+    )
+
+
 if __name__ == "__main__":
     log_path = configure_logging()
     logging.getLogger(__name__).info(f"starting on port {PORT}, logging to {log_path}")
@@ -398,4 +454,5 @@ if __name__ == "__main__":
     # the console is where someone is looking.
     print(f"embeddings-visualizer: port {PORT}, log {log_path}", flush=True)
     threading.Thread(target=_warm_umap, daemon=True).start()
+    threading.Thread(target=_warm_containers, daemon=True).start()
     create_app().run(host="0.0.0.0", port=PORT, debug=False, threaded=True)

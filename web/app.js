@@ -1237,23 +1237,26 @@ function drawLegend() {
     }));
 }
 
-/** Reflect whether the model/modes were detected or declared by hand.
+/** Show which query modes this index accepts.
  *
- * The model comes from the batch a vector was written in, which is
- * authoritative, so the manual checkboxes are disabled rather than left looking
- * like they still decide anything. `model_id` is "unknown" when no batch could
- * be read — then the declared modes are all there is.
+ * Read-only: the model comes from the batch a vector was written in, which is
+ * authoritative, and the modes follow the model — each one names a tagger
+ * container and the modalities that container takes. So the checkboxes report
+ * rather than decide, and are disabled either way. `model_id` is "unknown" when
+ * no batch could be read; such an index is queried through the default
+ * container, which is text-only.
  */
 function applyDetectedModel(data) {
   const model = data.model_id && data.model_id !== "unknown" ? data.model_id : null;
 
   document.querySelectorAll("#modes input").forEach((input) => {
-    input.disabled = !!model;
-    if (model) input.checked = data.modes.includes(input.value);
+    input.disabled = true;
+    input.checked = data.modes.includes(input.value);
   });
   $("modes-field").title = model
     ? `Detected from the index's batches: ${model}`
-    : "No batch reported a model for this index, so declare its query modes here.";
+    : "No batch reported a model for this index, so it is queried through the "
+      + "default container, which accepts text only.";
   $("modes-field").classList.toggle("detected", !!model);
   return model;
 }
@@ -1270,6 +1273,18 @@ function drawStats(data) {
     const tuned = Object.keys(data.tuning || {}).length;
     parts.push(`model <b>${escapeHtml(model)}</b> · from batch${
       tuned ? ` · ${tuned} stamped parameter${tuned === 1 ? "" : "s"}` : ""}`);
+    // The container runs on config.yml's recipe, not this index's. Where they
+    // differ, queries are embedded under different parameters than the vectors
+    // were — which does not fail, it just returns worse neighbours, so it has
+    // to be visible rather than left in the log.
+    const clash = Object.entries(data.tuning_mismatch || {});
+    if (clash.length) {
+      parts.push(`<span class="warn">queries use the container's ${clash
+        .map(([k, v]) => `${escapeHtml(k)}=${escapeHtml(String(v.configured))}`)
+        .join(", ")}, but this index was tagged with ${clash
+        .map(([k, v]) => `${escapeHtml(k)}=${escapeHtml(String(v.index))}`)
+        .join(", ")}</span>`);
+    }
   } else {
     parts.push(`model <b>unknown</b> · <span class="warn">no batch reported one</span>`);
   }
@@ -1298,7 +1313,6 @@ async function loadIndex() {
   const token = await authToken(qid);
   if (!token) return alert("An auth token is required.");
 
-  const modes = [...document.querySelectorAll("#modes input:checked")].map((i) => i.value);
   // const sources = $("sources").value.split(",").map((s) => s.trim()).filter(Boolean);
   const sources = [];   // the header no longer exposes a sources filter
   const method = document.querySelector("#method .on").dataset.method;
@@ -1314,7 +1328,6 @@ async function loadIndex() {
       body: JSON.stringify({
         index_qid: qid,
         sources,
-        modes,
         method,
         sample_size: Number($("sample-size").value) || 10000,
       }),

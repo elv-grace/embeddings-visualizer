@@ -67,8 +67,9 @@
        picture is not self-evident. -->
   <button id="help-toggle" class="help" title="How to use" aria-label="How to use">?</button>
 
-  <!-- Only used when no batch reported a model for the index. When one does,
-       the model and its query modes are detected and these are disabled. -->
+  <!-- Read-only. The query modes follow the index's model, which comes from the
+       batches its rows name; an index with no model is queried through the
+       default container, which takes text only. -->
   <div class="field narrow" id="modes-field">
     <span>Query modes</span>
     <div class="modes" id="modes">
