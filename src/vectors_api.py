@@ -1,33 +1,27 @@
-"""Retrieve a representative sample of an index's vectors and their metadata.
-
-Enumeration
------------
-The vectorstore exposes no scan endpoint: every read goes through /search, which
-is a KNN around a reference vector. Membership in the result is nevertheless
-independent of that vector whenever the filtered subset is smaller than `limit` --
-the search filters (qids, track, start_time_gte/lte) are pre-filtered, so the
-search runs an exact KNN over the filtered subset and returns all of it. Walking
-the timeline in windows narrow enough to stay under `limit` therefore enumerates
-the index exactly, with the reference vector only setting the order within a
-window. Truncation is detected rather than assumed: a window that comes back full
-is bisected and retried, so this stays correct even if the pre-filter semantics
-differ from the ones documented in vectorstore-swagger.yaml (which describes
-/spaces, not the deployed /indexes API).
+"""Retrieve a random sample of an index's vectors, and search the whole index.
 
 Sampling
 --------
-A vector is ~12 KB of JSON, so enumerating an index with them inline does not
-scale. The counting pass runs with include_vector=false (~150 B/row) to get each
-window's population, each window is then given a quota proportional to that
-population, and only the quota is refetched with vectors. Transfer is O(sample),
-not O(index).
+`/search` takes a `shuffle_seed`: with one set the rows come back in a random
+order rather than by distance, so the first `limit` of them are a uniform random
+sample of whatever the filters selected. One call therefore draws the sample
+directly -- no enumeration, no per-window quotas, and no reference vector whose
+direction biases what is returned.
 
-Within a window the quota is still the k nearest to the reference vector, so each
-window draws its own random probe direction: the strata are covered
-proportionally and the within-window bias varies independently across windows
-instead of compounding into one global cone. A single fixed probe -- [0.5]*d or
-one random draw alike -- returns a cone of the space around one direction, which
-is not a sample of the index.
+This replaces a timeline walk that bisected the index into windows small enough
+to read exactly, counted each one without vectors, then refetched a
+proportional quota from each. That existed because every read was a KNN and a
+KNN is a cone, not a sample; `shuffle_seed` makes it unnecessary. Transfer is
+O(sample) either way, but it is now one request instead of O(index/2000) of them.
+
+Search
+------
+The sample is what gets *plotted*; it is not what a query searches. `search` is
+a KNN over the whole index -- an HNSW lookup in the vectorstore's pgvector
+partition, which is the one place that can see every row -- so a query finds its
+true nearest vectors whether or not they were sampled. The hits come back with
+their embeddings, which is what lets the caller project them into the picture
+the sample fitted.
 """
 
 from __future__ import annotations
@@ -44,15 +38,13 @@ VECTORSTORE_URL = "http://localhost:8108"
 
 TIMEOUT_SECONDS = 60.0
 
-# Rows one /search call may return. Windows returning this many are treated as
-# truncated and bisected.
-WINDOW_LIMIT = 2000
-
-# Upper bound of the timeline walk, in ms. start_time is an Int4 column, and a
-# larger bound makes the search fail with a 500 rather than return nothing.
-MAX_START_TIME_MS = 2 ** 31 - 1
-
 DEFAULT_SAMPLE_SIZE = 10_000
+
+# Hits one query pulls out of the index. Only the top few are linked and listed;
+# the rest are plotted, so the neighbourhood the query landed in is visible
+# rather than just its winner. Kept well under a sample's worth: these carry
+# vectors and are fetched on every search.
+SEARCH_LIMIT = 100
 
 
 class VectorStoreError(RuntimeError):
@@ -111,26 +103,25 @@ def _search(
     index_qid: str,
     auth_token: str,
     *,
-    vector: Sequence[float],
     limit: int,
+    vector: Optional[Sequence[float]] = None,
+    shuffle_seed: Optional[int] = None,
     include_vector: bool = False,
     sources: Optional[List[str]] = None,
-    start_time_gte: Optional[int] = None,
-    start_time_lte: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
-    """POST /indexes/{qid}/search and return the raw result rows."""
-    body: Dict[str, Any] = {
-        "vector": list(vector),
-        "limit": limit,
-        "include_vector": include_vector,
-    }
+    """POST /indexes/{qid}/search and return the raw result rows.
+
+    `vector` only orders the results, so it is omitted for a shuffled read: a
+    KNN that is about to be shuffled is work done to be thrown away.
+    """
+    body: Dict[str, Any] = {"limit": limit, "include_vector": include_vector}
+    if vector is not None:
+        body["vector"] = list(vector)
+    if shuffle_seed is not None:
+        body["shuffle_seed"] = shuffle_seed
     # Omitted rather than sent empty: an empty filter is not always a no-op.
     if sources:
         body["sources"] = sources
-    if start_time_gte is not None:
-        body["start_time_gte"] = start_time_gte
-    if start_time_lte is not None:
-        body["start_time_lte"] = start_time_lte
 
     response = requests.post(
         f"{VECTORSTORE_URL}/indexes/{index_qid}/search",
@@ -138,7 +129,6 @@ def _search(
         headers=_headers(auth_token),
         timeout=TIMEOUT_SECONDS,
     )
-    # response.raise_for_status()
     _check(response, f"search of {index_qid}")
     return (response.json() or {}).get("results", [])
 
@@ -208,70 +198,37 @@ def batch_models(
     return models
 
 
-def _random_probe(vector_size: int, rng: random.Random) -> List[float]:
-    """A uniformly random direction on the unit sphere."""
-    raw = [rng.gauss(0.0, 1.0) for _ in range(vector_size)]
-    norm = sum(x * x for x in raw) ** 0.5 or 1.0
-    return [x / norm for x in raw]
 
+def _shuffle_seed(seed: int) -> int:
+    """A non-zero `shuffle_seed` derived deterministically from `seed`.
 
-def count_windows(
-    index_qid: str,
-    auth_token: str,
-    probe: Sequence[float],
-    sources: Optional[List[str]] = None,
-) -> List[Tuple[int, int, int]]:
-    """Partition the timeline into windows of at most WINDOW_LIMIT rows.
-
-    Returns (start_time_gte, start_time_lte, row_count) per non-empty window.
-    Runs without vectors, so the whole index costs ~150 B/row to walk.
+    shuffle_seed is a plain int on the request struct, so a literal 0 cannot be
+    told apart from an omitted field and the search would fall back to distance
+    order. 0 is exactly the default `seed`, so that is the one case that must
+    not quietly stop shuffling. Drawing through a seeded RNG keeps the mapping
+    deterministic -- one seed always draws the same sample, so an index projects
+    to the same picture on every run -- while staying non-zero and positive.
     """
-    windows: List[Tuple[int, int, int]] = []
-    # Explicit stack rather than recursion: the bisection can go ~40 deep.
-    pending = [(0, MAX_START_TIME_MS)]
+    return random.Random(seed).randrange(1, 2 ** 31)
 
-    while pending:
-        lo, hi = pending.pop()
-        rows = _search(
-            index_qid,
-            auth_token,
-            vector=probe,
-            limit=WINDOW_LIMIT,
-            include_vector=False,
-            sources=sources,
-            start_time_gte=lo,
-            start_time_lte=hi,
-        )
-        if not rows:
+
+def _unpack(rows: List[Dict[str, Any]]) -> Tuple[List[List[float]], List[Dict[str, Any]]]:
+    """Split search results into (vectors, metadata), positionally aligned.
+
+    A row whose embedding did not come back is dropped rather than padded: it
+    cannot be projected or ranked, and a metadata entry with no vector behind it
+    would silently misalign every index after it.
+    """
+    vectors: List[List[float]] = []
+    metadata: List[Dict[str, Any]] = []
+    for row in rows:
+        entry = dict(row.get("vector") or {})
+        vector = entry.pop("vector", None)
+        if vector is None:
             continue
-        if len(rows) >= WINDOW_LIMIT and hi > lo:
-            mid = (lo + hi) // 2
-            pending.append((lo, mid))
-            pending.append((mid + 1, hi))
-            continue
-        if len(rows) >= WINDOW_LIMIT:
-            # More than WINDOW_LIMIT rows share one timestamp; cannot split further.
-            logger.warning(f"window [{lo}, {hi}] is saturated, rows beyond {WINDOW_LIMIT} are invisible")
-        windows.append((lo, hi, len(rows)))
-
-    windows.sort()
-    return windows
-
-
-def _quotas(counts: Sequence[int], sample_size: int) -> List[int]:
-    """Apportion sample_size across windows proportionally (largest remainder)."""
-    total = sum(counts)
-    if total <= sample_size:
-        return list(counts)
-
-    exact = [c * sample_size / total for c in counts]
-    quotas = [int(x) for x in exact]
-    # Largest remainder, so the quotas sum to exactly sample_size.
-    remainder = sample_size - sum(quotas)
-    order = sorted(range(len(counts)), key=lambda i: exact[i] - quotas[i], reverse=True)
-    for i in order[:remainder]:
-        quotas[i] += 1
-    return quotas
+        vectors.append(vector)
+        metadata.append(entry)
+    return vectors, metadata
 
 
 def get_vectors(
@@ -281,60 +238,60 @@ def get_vectors(
     sample_size: int = DEFAULT_SAMPLE_SIZE,
     seed: int = 0,
 ) -> Tuple[List[List[float]], List[Dict[str, Any]]]:
-    """Return (vectors, metadata) for a proportional sample of the index.
+    """Return (vectors, metadata) for a random sample of the index.
 
     Positionally aligned: metadata[i] describes vectors[i]. The sample is the
-    whole index when it holds fewer than sample_size rows. `seed` fixes the probe
-    directions so a given index projects to the same picture on every run.
+    whole index when it holds fewer than sample_size rows, and is drawn in one
+    shuffled read -- see this module's docstring.
     """
-    rng = random.Random(seed)
-
-    index = get_index(index_qid, auth_token)
-    vector_size = index.get("vector_size")
-    if not vector_size:
-        raise VectorStoreError(f"index {index_qid} reported no vector_size: {index}")
-    logger.info(f"Index `{index_qid}`: vector_size={vector_size}")
-
     track_counts = get_track_counts(index_qid, auth_token)
     if track_counts:
         logger.info(f"Tracks: {track_counts} (total {sum(track_counts.values())})")
 
-    logger.info("Counting rows per window (no vectors)...")
-    windows = count_windows(index_qid, auth_token, _random_probe(vector_size, rng), sources)
-    population = sum(count for _, _, count in windows)
-    if population == 0:
-        return [], []
-    logger.info(f"Enumerated {population} rows across {len(windows)} windows")
+    logger.info(f"Reading up to {sample_size} vectors in shuffled order...")
+    rows = _search(
+        index_qid,
+        auth_token,
+        limit=sample_size,
+        shuffle_seed=_shuffle_seed(seed),
+        include_vector=True,
+        sources=sources,
+    )
+    vectors, metadata = _unpack(rows)
 
-    quotas = _quotas([count for _, _, count in windows], sample_size)
-
-    vectors: List[List[float]] = []
-    metadata: List[Dict[str, Any]] = []
-    for (lo, hi, _count), quota in zip(windows, quotas):
-        if quota <= 0:
-            continue
-        rows = _search(
-            index_qid,
-            auth_token,
-            # A fresh direction per window, so no single direction biases the sample.
-            vector=_random_probe(vector_size, rng),
-            limit=quota,
-            include_vector=True,
-            sources=sources,
-            start_time_gte=lo,
-            start_time_lte=hi,
-        )
-        for row in rows:
-            entry = dict(row.get("vector") or {})
-            vector = entry.pop("vector", None)
-            if vector is None:
-                continue
-            vectors.append(vector)
-            metadata.append(entry)
-
-    logger.info(f"Retrieved {len(vectors)} of {population} vectors from index `{index_qid}`")
-
+    population = sum(track_counts.values())
+    logger.info(
+        f"Retrieved {len(vectors)}"
+        + (f" of {population}" if population else "")
+        + f" vectors from index `{index_qid}`"
+    )
     return vectors, metadata
+
+
+def search_vectors(
+    index_qid: str,
+    auth_token: str,
+    vector: Sequence[float],
+    limit: int = SEARCH_LIMIT,
+    sources: Optional[List[str]] = None,
+) -> Tuple[List[List[float]], List[Dict[str, Any]]]:
+    """Return (vectors, metadata) for the `limit` nearest rows to `vector`.
+
+    Unshuffled, so this is the vectorstore's own ranking over the *whole* index,
+    not over the plotted sample. Embeddings are requested because the caller has
+    to place the hits in a projection fitted elsewhere and rank them itself --
+    the response's `distance` is not returned, so that one scale governs both
+    the sampled points and these.
+    """
+    rows = _search(
+        index_qid,
+        auth_token,
+        limit=limit,
+        vector=vector,
+        include_vector=True,
+        sources=sources,
+    )
+    return _unpack(rows)
 
 
 def modality(meta: Dict[str, Any]) -> str:
@@ -358,58 +315,3 @@ def modality(meta: Dict[str, Any]) -> str:
     if start is not None and end is not None and end > start:
         return "video"
     return "unknown"
-
-
-# Replaced by the windowed enumeration above; kept for reference.
-#
-# def get_vectors(index_qid: str, auth_token: str, sources: list[str]=[]):
-#     vectorstore = "http://localhost:8108/indexes"
-#
-#     request_vector_size = ["curl", "-X", "GET",
-#                            f"{vectorstore}/{index_qid}",
-#                            "-H", f"Authorization: Bearer {auth_token}",
-#                            "-H", "Accept: application/json"
-#                            ]
-#     print(f"Calling VectorStore API to retrieve vector size in index `{index_qid}`...")
-#     result = subprocess.run(request_vector_size, capture_output=True, text=True, check=True)
-#     data = json.loads(result.stdout)
-#     vector_size = data.get("vector_size")
-#     print(f"Vector size in index `{index_qid}`: {vector_size}")
-#
-#     request_vector_count = ["curl", "-X", "GET",
-#                             f"{vectorstore}/{index_qid}/tracks",
-#                             "-H", f"Authorization: Bearer {auth_token}",
-#                             "-H", "Accept: application/json"
-#                             ]
-#     print(f"Calling VectorStore API to retrieve vector count in index `{index_qid}`...")
-#     result = subprocess.run(request_vector_count, capture_output=True, text=True, check=True)
-#     data = json.loads(result.stdout)
-#     vector_count = 0
-#     tracks = data.get("tracks", [])
-#     for track in tracks:
-#         vector_count += track.get("count", 0)
-#     print(f"Vector count in index `{index_qid}`: {vector_count}")
-#
-#     ref_vector = [0.5] * vector_size
-#     request_vectors = ["curl", "-X", "POST",
-#                         f"{vectorstore}/{index_qid}/search",
-#                         "-H", f"Authorization: Bearer {auth_token}",
-#                         "-H", "Content-Type: application/json",
-#                         "-H", "Accept: application/json",
-#                         "-d", f"""{{"limit": {vector_count}, "sources": {sources}, "vector": {ref_vector}, "include_vector": true}}"""
-#                         ]
-#     print(f"Calling VectorStore API to retrieve vectors in index `{index_qid}`...")
-#     result = subprocess.run(request_vectors, capture_output=True, text=True, check=True)
-#     data = json.loads(result.stdout)
-#     results = data.get("results", [])
-#     vectors = []
-#     metadata = []
-#     for object in results:
-#         vector = object.get("vector").get("vector")
-#         vectors.append(vector)
-#         metainfo = object.get("vector")
-#         del metainfo["vector"]
-#         metadata.append(metainfo)
-#     assert len(vectors) == vector_count, f"Expected {vector_count} vectors, but got {len(vectors)}"
-#     print(f"Retrieved {len(vectors)} vectors from index `{index_qid}`.")
-#     return vectors, metadata

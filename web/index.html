@@ -95,11 +95,14 @@
       next <b>Load</b>.</p>
 
       <h3>Sample</h3>
-      <p>How many vectors to fetch and plot. The index is counted first and the
-      sample drawn proportionally across its whole timeline, so a smaller number
-      still spans the entire index rather than taking the first N of it.</p>
+      <p>How many vectors to fetch and plot. They are drawn at random from across
+      the whole index, not taken from the front of it, so a smaller number still
+      gives a fair picture of the space.</p>
       <p>Lower is faster and gives a sparser map; higher is denser and slower to
       project. An index holding fewer vectors than this is plotted in full.</p>
+      <p>This limits what is <b>drawn</b>, not what is <b>findable</b>: a search
+      is run by the index itself over every vector in it, and any match that was
+      not in the sample is added to the map when it is found.</p>
 
       <h3>Projection</h3>
       <p>Vectors have ~1000 dimensions and a screen has two, so they have to be
@@ -122,6 +125,10 @@
       is not necessarily one of its closest matches. Search results are ranked in
       the vectors' original dimensions and drawn as <b>links</b> from the query
       node — trust those, not what looks near.</p>
+      <p>A search takes the index's top 100 hits and adds any that were not
+      already sampled, so the node count grows as you search. The nearest 10 are
+      the ones linked and listed; the rest fill in the neighbourhood the query
+      landed in.</p>
     </div>
   </div>
 

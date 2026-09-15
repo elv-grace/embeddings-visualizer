@@ -101,15 +101,24 @@ tuning stamped on an index's rows is read only to check it against them.
 
 ## How it works
 
-**The index is enumerated, not scanned.** The vectorstore has no scan endpoint —
-every read is a KNN around a reference vector. But its filters are
-*pre-filtered*, so once a time window holds fewer rows than `limit`, the top-K
-over it *is* the whole window. Walking the timeline in windows therefore
-enumerates the index exactly.
+**The plot is a random sample, drawn in one call.** `/search` takes a
+`shuffle_seed`: with one set the rows come back in random order rather than by
+distance, so the first `limit` of them are a uniform sample of the index. A
+vector is ~12 KB of JSON, so plotting is bounded by `sample_size` (10,000 by
+default) rather than by how large the index is. The seed is derived from the
+request's `seed`, so the same index draws the same sample — and the same
+picture — on every run. The browser receives 2D coordinates plus metadata,
+never vectors.
 
-**Only a sample carries vectors.** A vector is ~12 KB of JSON, so the counting
-pass runs without them (~150 B/row) and only the sample is refetched in full.
-The browser receives 2D coordinates plus metadata, never vectors.
+**A search sees the whole index, not the sample.** The sample bounds what is
+*drawn*; letting it bound what is *findable* would make every query a search of
+ten thousand arbitrary rows. So a query is ranked by the vectorstore itself — an
+HNSW lookup over every row — and its top 100 hits come back with their
+embeddings. Those are placed in the fitted projection with the same `transform`
+an out-of-sample row uses and added to the plot, deduplicated against what was
+already there. The nearest 10 are linked and listed, as before; the other 90 are
+plotted unlabelled so the neighbourhood the query landed in is visible and not
+just its winner.
 
 **The 2D positions are layout, never a measurement.** Any projection distorts
 neighbourhoods. Similarity is ranked by cosine in the *original* space and drawn
@@ -147,7 +156,7 @@ only assumption safe to make about an unidentified space.
 | | |
 |---|---|
 | `src/app.py` | HTTP service; serves the API and the frontend from one origin |
-| `src/vectors_api.py` | enumerates and samples an index out of the vectorstore |
+| `src/vectors_api.py` | samples an index out of the vectorstore, and searches all of it |
 | `src/projection.py` | PCA → UMAP to 2D, plus the query's neighbour anchoring |
 | `src/embedder.py` | model → container registry, the tuning parameters, and the query side |
 | `src/tagger.py` | runs a tagger container and reads the vector back over its protocol |
@@ -160,7 +169,10 @@ only assumption safe to make about an unidentified space.
 | `web/vendor/`    | elv-client-js's prebuilt `FrameClient` (used only inside core) |
 
 Two endpoints: `POST /api/index` loads, samples and projects;
-`POST /api/search/<mode>` embeds a query and ranks it. Everything else is static.
+`POST /api/search/<mode>` embeds a query, ranks it against the whole index and
+returns both its neighbours and the hits to add to the plot. Both take the
+fabric token in an `Authorization` header — it is forwarded to the vectorstore
+and never stored, so a search needs one of its own. Everything else is static.
 
 ---
 

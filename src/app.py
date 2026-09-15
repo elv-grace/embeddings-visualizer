@@ -20,7 +20,7 @@ import threading
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from flask import Flask, jsonify, request, send_from_directory
@@ -37,11 +37,13 @@ from projection import METHODS, Projector, ProjectionError, anchor_to_neighbours
 from tagger import status as container_status
 from vectors_api import (
     DEFAULT_SAMPLE_SIZE,
+    SEARCH_LIMIT,
     VectorStoreError,
     batch_models,
     get_track_counts,
     get_vectors,
     modality,
+    search_vectors,
 )
 
 logger = logging.getLogger(__name__)
@@ -99,6 +101,9 @@ ALL_MODES = ("text", "image", "video")
 # otherwise be copied to disk and handed to a model in full.
 MAX_UPLOAD_BYTES = int(os.environ.get("EV_MAX_UPLOAD_MB") or 512) * 1024 * 1024
 
+# Of the SEARCH_LIMIT hits a query pulls from the index, how many are linked
+# and listed. The rest are plotted unlabelled: the point of fetching them is to
+# show the neighbourhood the query landed in, not to rank 100 rows at a viewer.
 TOP_K = 10
 
 # Loaded indexes are held for the process's life, and each pins its full vector
@@ -130,10 +135,58 @@ class LoadedIndex:
     # only tune the tower the batch's model already chose -- see embedder.TUNING_KEYS.
     tuning: Dict[str, Any] = field(default_factory=dict)
     embedder: Optional[Any] = None
+    # Row id -> its position in `metadata`, built on the first merge. None until
+    # then rather than empty, so an index whose rows carry no id does not
+    # rebuild the map on every search.
+    positions: Optional[Dict[Any, int]] = None
 
     @property
     def model(self) -> Optional[str]:
         return next(iter(self.models.values()), None)
+
+    def merge(
+        self, vectors: np.ndarray, metadata: List[Dict[str, Any]]
+    ) -> Tuple[List[int], int]:
+        """Fold search hits into the plotted set; return where each one landed.
+
+        Returns (position per input row, the first position appended). A query
+        searches the whole index, so most of its hits were never sampled and
+        have to be projected and added before they can be linked to. They are
+        placed with the same `transform` the out-of-sample rows of a large index
+        use, so they land in the picture that is already on screen rather than
+        moving it.
+
+        A hit that *was* sampled keeps the position it already has. Appending it
+        again would put a second node on top of the first and point the
+        neighbour link at whichever of the two the viewer is not looking at.
+
+        Caller holds the lock: this mutates the arrays a concurrent search reads.
+        """
+        if self.positions is None:
+            self.positions = {
+                m["id"]: i for i, m in enumerate(self.metadata) if m.get("id") is not None
+            }
+
+        added_from = len(self.metadata)
+        fresh: List[int] = []
+        at: List[int] = []
+        for i, meta in enumerate(metadata):
+            row_id = meta.get("id")
+            known = self.positions.get(row_id) if row_id is not None else None
+            if known is None:
+                known = added_from + len(fresh)
+                fresh.append(i)
+                if row_id is not None:
+                    self.positions[row_id] = known
+            at.append(known)
+
+        if fresh:
+            rows = vectors[fresh]
+            self.coords = np.vstack([self.coords, self.projector.transform(rows)])
+            self.vectors = np.vstack([self.vectors, rows])
+            self.metadata.extend(metadata[i] for i in fresh)
+
+        return at, added_from
 
 
 _indexes: Dict[str, LoadedIndex] = {}
@@ -186,18 +239,19 @@ def create_app(static_dir: str = "../web") -> Flask:
         if not vectors:
             # Say which of the two this is. The index answered (a missing or
             # unreadable one raises above and returns 400/502), so either it
-            # genuinely holds nothing, or it holds rows the timeline walk cannot
-            # reach -- rows whose start_time is null or outside
-            # [0, MAX_START_TIME_MS] are invisible to a start_time-filtered
-            # search. The track counts separate those two without another guess.
+            # genuinely holds nothing, or it holds rows the read returned
+            # without their embeddings -- a row with no `vector` cannot be
+            # projected and is dropped. The track counts separate those two
+            # without another guess.
             try:
                 counts = get_track_counts(index_qid, token)
             except Exception:
                 counts = {}
             total = sum(counts.values())
             detail = (
-                f"but its tracks report {total} rows ({counts}) -- those rows are not "
-                "reachable by a start_time-filtered search, so check start_time is set"
+                f"but its tracks report {total} rows ({counts}) -- the search returned "
+                "no embeddings for them, so check the index holds vectors and not only "
+                "documents"
                 if total
                 else "and its tracks report no rows either, so the index is empty"
             )
@@ -293,7 +347,15 @@ def create_app(static_dir: str = "../web") -> Flask:
 
     @app.post("/api/search/<mode>")
     def search(mode: str):
-        """Embed a query, place it in the fitted projection, rank in full dims."""
+        """Embed a query, rank it against the whole index, and plot what it found.
+
+        The ranking is the vectorstore's, over every row in the index, rather
+        than a scan of the sample held here: the sample bounds what is *drawn*,
+        and letting it bound what is *findable* would make every search a search
+        of ten thousand arbitrary rows. The hits it returns are folded into the
+        projection and sent back as new points, so a match is on screen whether
+        or not it was sampled.
+        """
         if mode not in ALL_MODES:
             return _error(f"unknown mode {mode!r}", 404)
 
@@ -301,6 +363,13 @@ def create_app(static_dir: str = "../web") -> Flask:
         loaded = _indexes.get(key or "")
         if loaded is None:
             return _error("index not loaded; load an index first", 404)
+
+        # Loading the index did not keep its token -- it is forwarded and
+        # dropped -- and the vectorstore authorizes per request, so the search
+        # needs one of its own.
+        token = _token()
+        if not token:
+            return _error("missing Authorization token", 401)
 
         if mode not in loaded.modes:
             # Wording fixed by the spec in README.md.
@@ -339,15 +408,52 @@ def create_app(static_dir: str = "../web") -> Flask:
             return _error(f"could not embed query: {exc}", 500)
 
         query = np.asarray(vector, dtype=np.float32)
+
         try:
-            neighbours = top_k_similar(loaded.vectors, query, k=TOP_K)
+            hits, hit_meta = search_vectors(
+                loaded.index_qid, token, query.tolist(), limit=SEARCH_LIMIT
+            )
+        except VectorStoreError as exc:
+            return _error(str(exc), 400)
+        except Exception as exc:
+            return _error(f"could not search index: {exc}", 502)
+        if not hits:
+            return _error(
+                f"index {loaded.index_qid} returned no hits for this query", 404
+            )
+
+        matrix = np.asarray(hits, dtype=np.float32)
+        try:
+            # Re-ranked here rather than read off the response's `distance`, so
+            # one scale governs both these hits and anything else this service
+            # scores. It also settles the width check before the hits are merged.
+            ranked = top_k_similar(matrix, query, k=TOP_K)
+            with _lock:
+                at, added_from = loaded.merge(matrix, hit_meta)
+                # Sliced under the same lock that appended it. A concurrent
+                # search on this index appends too, and a slice taken after the
+                # release would hand this response the other query's rows as
+                # well -- which the frontend would then plot twice, once per
+                # response. `coords` is rebound by a merge, never written in
+                # place, so the reference taken here stays this snapshot.
+                coords = loaded.coords
+                added = _points(
+                    coords[added_from:], loaded.metadata[added_from:], offset=added_from
+                )
+                count = len(loaded.metadata)
+            neighbours = [(at[i], similarity) for i, similarity in ranked]
             # Anchored to its neighbours rather than projected: see
             # projection.anchor_to_neighbours for why the projected point of an
             # off-manifold query carries no information.
-            x, y = anchor_to_neighbours(loaded.coords, neighbours)
+            x, y = anchor_to_neighbours(coords, neighbours)
             projected = loaded.projector.transform(query.reshape(1, -1))[0]
         except ProjectionError as exc:
             return _error(str(exc), 400)
+
+        logger.info(
+            f"query ({mode}) on {loaded.index_qid}: {len(hits)} hits from the index, "
+            f"{len(added)} new to the plot, best {ranked[0][1]:.4f}"
+        )
 
         return jsonify(
             {
@@ -355,6 +461,15 @@ def create_app(static_dir: str = "../web") -> Flask:
                 "query_point": {"x": x, "y": y},
                 # Kept for comparison; not what the node is drawn at.
                 "projected_point": {"x": float(projected[0]), "y": float(projected[1])},
+                # How many rows the index was asked for, and how many of them
+                # were not already plotted. The frontend says so: a viewer has
+                # to know the search saw the whole index, not just the sample.
+                "searched": len(hits),
+                "count": count,
+                # The hits that were not in the sample, ready to append. `i` is
+                # already their position in the loaded set, which is what
+                # `neighbours[].index` refers to.
+                "points": added,
                 # Ranked in the original space: 2D proximity is not similarity.
                 "neighbours": [
                     {"index": i, "similarity": s, "id": loaded.metadata[i].get("id")}
@@ -388,15 +503,18 @@ def create_app(static_dir: str = "../web") -> Flask:
 
 
 def _points(
-    coords: np.ndarray, metadata: List[Dict[str, Any]]
+    coords: np.ndarray, metadata: List[Dict[str, Any]], offset: int = 0
 ) -> List[Dict[str, Any]]:
     """The per-node payload: position, modality, and the metadata for the card.
 
     Modality is inferred from which fields a row populates -- see
-    `vectors_api.modality`."""
+    `vectors_api.modality`. `offset` is where this slice starts in the loaded
+    index: `i` is the frontend's handle on a node and has to stay the position
+    in the whole set, so a batch of search hits appended to the end numbers from
+    there rather than from 0."""
     return [
         {
-            "i": i,
+            "i": offset + i,
             "x": float(coords[i][0]),
             "y": float(coords[i][1]),
             "modality": modality(meta),

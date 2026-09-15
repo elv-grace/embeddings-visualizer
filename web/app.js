@@ -66,6 +66,7 @@ const state = {
   queries: [],
   nextQueryN: 1,
   viewState: null,
+  stats: null,         // the last /api/index response, replayed when the count changes
   deck: null,
   client: undefined,   // undefined = not yet probed, null = standalone
 
@@ -1356,6 +1357,7 @@ async function loadIndex() {
     initDeck();
     $("zoom").hidden = false;
     drawLegend();
+    state.stats = data;
     drawStats(data);
     render();
   } catch (err) {
@@ -1380,9 +1382,23 @@ async function runSearch(mode, payload, label, preview) {
   busy(true, "Embedding query…");
 
   try {
+    // The search half of this runs against the vectorstore, which authorizes
+    // every call: loading the index forwarded a token, it did not keep one.
+    const token = await authToken(state.indexQid);
+    if (!token) throw new Error("An auth token is required to search this index.");
+    // Merged, not replaced — an upload's payload is a FormData whose
+    // Content-Type only the browser can set, boundary and all.
+    payload.headers = { ...(payload.headers || {}), Authorization: `Bearer ${token}` };
+
     const res = await fetch(`${API}/api/search/${mode}`, payload);
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || `request failed (${res.status})`);
+
+    // The query searched the whole index, so most of what it found was never
+    // sampled and is not on the map yet. Adding the hits first is what makes
+    // `neighbours[].index` resolve — those are positions in this array.
+    // A new array, not a push: deck.gl compares `data` by reference.
+    if (data.points?.length) state.points = [...state.points, ...data.points];
 
     const q = {
       id: `q${state.nextQueryN}`,
@@ -1403,6 +1419,12 @@ async function runSearch(mode, payload, label, preview) {
     // mutating in place leaves the layer rendering the old point count.
     state.queries = [...state.queries, q];
     drawLegend();
+    // The header count is how many vectors are plotted, and a search just
+    // changed that.
+    if (state.stats && data.count) {
+      state.stats.count = data.count;
+      drawStats(state.stats);
+    }
     // Up for a beat, then out of the way; the query node brings them back.
     flashLinks(q);
 
@@ -1410,8 +1432,16 @@ async function runSearch(mode, payload, label, preview) {
     // The absolute number is worth showing but needs its scale named: SigLIP
     // scores a text-to-image match an order of magnitude lower than an
     // image-to-image one, so 0.07 from a text query is a strong hit.
-    note.innerHTML = `Query placed. Links mark its <b>${data.neighbours.length}</b> nearest
-      vectors by true cosine similarity, not by distance on screen.
+    //
+    // The counts matter too: the plot is a sample, the search was not, so this
+    // says how many rows it actually ranked and how many of its hits are new to
+    // the map — otherwise a hit appearing out of nowhere reads as a glitch.
+    note.innerHTML = `Query placed. Searched the <b>whole index</b> and took its top
+      <b>${data.searched}</b>${data.points?.length
+        ? `, <b>${data.points.length}</b> of which were not in the sample and have been
+           added to the plot` : ""}.
+      Links mark the <b>${data.neighbours.length}</b> nearest of them by true cosine
+      similarity, not by distance on screen.
       Best ${best ? `<b>${best.similarity.toFixed(3)}</b>` : "—"} — compare within a
       ${mode} search, not across modes. Links fade after a moment — hover or
       click the query node to bring them back.`;
