@@ -52,6 +52,19 @@
 10k loads in seconds; 100k costs ~1.2 GB from the vectorstore and ~80 s in UMAP.">
   </label>
 
+  <!-- Populated from the tracks the loaded index reports, so it is empty and
+       disabled until there is one. Changing it reloads immediately rather than
+       waiting for Load: it is a different set of vectors, fetched filtered from
+       the vectorstore, so the projection has to be refitted anyway. -->
+  <label class="field narrow">
+    <span>Track</span>
+    <select id="track" disabled
+            title="Plot only one track. The vectors are re-fetched filtered, so the
+sample is drawn from that track rather than sieved out of a sample of everything.">
+      <option value="">All tracks</option>
+    </select>
+  </label>
+
   <!-- PCA and UMAP fail in opposite directions, so both stay reachable:
        PCA keeps real distances but barely separates clusters; UMAP separates
        clusters but its 2D distances mean nothing. -->
@@ -91,8 +104,9 @@
       <h2>How to use</h2>
 
       <p class="lede">Enter an index QID and press <b>Load</b> to fetch its
-      vectors and plot each one as a node. Both controls below take effect on the
-      next <b>Load</b>.</p>
+      vectors and plot each one as a node. <b>Sample</b> and <b>Projection</b>
+      take effect on the next <b>Load</b>; <b>Track</b> reloads as soon as you
+      change it.</p>
 
       <h3>Sample</h3>
       <p>How many vectors to fetch and plot. They are drawn at random from across
@@ -103,6 +117,15 @@
       <p>This limits what is <b>drawn</b>, not what is <b>findable</b>: a search
       is run by the index itself over every vector in it, and any match that was
       not in the sample is added to the map when it is found.</p>
+
+      <h3>Track</h3>
+      <p>An index is written in tracks — one per tagger that contributed to it,
+      such as captions, shot embeddings or frame crops. Picking one re-fetches
+      the index filtered to that track, so the sample comes entirely from it
+      rather than being whatever share of the whole index it happens to be.</p>
+      <p>The filter applies to search as well: while a track is selected, a query
+      is ranked against that track only. Switching back to <b>All tracks</b>
+      reloads the unfiltered index.</p>
 
       <h3>Projection</h3>
       <p>Vectors have ~1000 dimensions and a screen has two, so they have to be

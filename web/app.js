@@ -717,8 +717,7 @@ function onQueryHover(info) {
      ${dl([
        ["neighbours", q.neighbours?.length ?? 0],
        ["best cos", best ? best.similarity.toFixed(3) : "—"],
-     ])}
-     <p class="text">Click to open this query and pin its links.</p>`,
+     ])}`,
     info
   );
 }
@@ -916,25 +915,35 @@ function teardownMedia() {
 
 /** What the media area shows before (or instead of) the fabric answers.
  *
- * Text is carried in the metadata itself, so it is final immediately. Unknown
- * modality never attempts media — the metadata is the content.
+ * Text is carried in the metadata itself, so the quote is final immediately —
+ * but the row usually also names a span of its object's timeline, and that span
+ * is fetched like any other clip and shown beneath the quote. Unknown modality
+ * never attempts media — the metadata is the content.
  */
 function mediaSkeleton(point) {
   const meta = point.meta;
 
   if (point.modality === "text") {
-    return `<p class="quote">${escapeHtml(meta.text || "")}</p>`;
+    const quote = `<p class="quote">${escapeHtml(meta.text || "")}</p>`;
+    // Not every text row is anchored to a timeline: a document embedding has no
+    // range, and there is nothing to play for it.
+    if (!hasClip(meta)) return quote;
+    return `${quote}<div id="detail-player">${pendingMedia(meta)}</div>`;
   }
   if (point.modality === "unknown") {
     return `<div class="placeholder">${unknownReason(meta)}</div>`;
   }
+  return pendingMedia(meta);
+}
+
+/** The unlock form or the spinner, whichever the media is waiting on. */
+function pendingMedia(meta) {
   if (needsToken(frameClient(), meta.qid)) {
     // Standalone there is no account to authorize against, so the viewer
     // supplies a token for this content object. Asked once per object, not
     // once per node — an index can hold vectors from several.
     return unlockForm(meta.qid);
   }
-
   return `<div class="placeholder loading">
     <span class="spinner"></span> Resolving media…
   </div>`;
@@ -963,7 +972,7 @@ function wireUnlock(point) {
     const token = input.value.trim();
     if (!token) return;
     setContentToken(point.meta.qid, token);
-    $("detail-media").innerHTML = `<div class="placeholder loading">
+    mediaHost().innerHTML = `<div class="placeholder loading">
       <span class="spinner"></span> Resolving media…
     </div>`;
     loadMedia(point);
@@ -982,7 +991,9 @@ function wireUnlock(point) {
  */
 function expandMedia(point, url) {
   const meta = point.meta;
-  const isVideo = point.modality === "video";
+  // Same test the panel used to decide what to fetch, so the overlay cannot
+  // disagree with it about what `url` is.
+  const isVideo = hasClip(meta);
   const box = isVideo ? null : detectionBox(meta);
 
   const overlay = document.createElement("div");
@@ -994,7 +1005,8 @@ function expandMedia(point, url) {
         ? `<video id="full-clip" controls playsinline autoplay></video>`
         : `<div class="frame"><img src="${url}" alt="">${box ? boxOverlay(box, meta.tag) : ""}</div>`}
       <figcaption>${isVideo
-        ? clipRange(meta)
+        ? clipRange(meta) + (meta.text
+            ? `<div class="said">${escapeHtml(truncate(meta.text, 220))}</div>` : "")
         : `Frame ${meta.frame_idx} @ ${formatTime(meta.start_time)}`}</figcaption>
     </figure>`;
   document.getElementById("stage").appendChild(overlay);
@@ -1075,26 +1087,53 @@ function boxOverlay(box, label) {
     label ? `<span>${escapeHtml(label)}</span>` : ""}</div>`;
 }
 
-/** How a clip's extent reads.
- *
- * A row only reaches here as `video`, which requires end_time > start_time, so
- * the extent is always real. Rows without one are `unknown` and never get a
- * player — see `unknownReason`.
- */
+/** How a clip's extent reads. */
 function clipRange(meta) {
   return `${formatTime(meta.start_time)} – ${formatTime(meta.end_time)}`;
+}
+
+/** True when this row names a real extent on its object's timeline.
+ *
+ * Playability is a property of the time range, not of the modality. A caption
+ * or transcript vector is classified `text` because it carries text, but it was
+ * embedded from a span of the same timeline a shot vector describes, so it is
+ * just as watchable — and watching it is how you check the caption against what
+ * was actually on screen.
+ *
+ * This is false for exactly the rows that have nothing to play: a frame is an
+ * instant (start == end), and an `unknown` row is unknown precisely because its
+ * range is missing or inverted — see `unknownReason`.
+ */
+function hasClip(meta) {
+  const start = meta?.start_time;
+  const end = meta?.end_time;
+  return start !== null && start !== undefined
+    && end !== null && end !== undefined && end > start;
+}
+
+/** Where the frame or the clip is written.
+ *
+ * A text row keeps its quote above the player, so its media goes in a nested
+ * host rather than replacing the whole panel section. Every other row has no
+ * such wrapper and writes straight into it.
+ */
+function mediaHost() {
+  return $("detail-player") || $("detail-media");
 }
 
 
 /** Fetch the frame or the clip and swap it into the open panel. */
 async function loadMedia(point) {
   const client = frameClient();
-  if (point.modality === "text" || point.modality === "unknown") return;
+  // What decides is whether there is anything to fetch, not the modality: a
+  // frame is addressed by its instant, everything else by its extent, and a row
+  // with neither has nothing to show.
+  if (point.modality !== "image" && !hasClip(point.meta)) return;
   if (needsToken(client, point.meta.qid)) return;   // waiting on the unlock form
 
   // Selections can outrun the fabric; only the newest one may write.
   const token = ++state.mediaToken;
-  const host = $("detail-media");
+  const host = mediaHost();
   const meta = point.meta;
 
   try {
@@ -1331,6 +1370,11 @@ async function loadIndex() {
         sources,
         method,
         sample_size: Number($("sample-size").value) || 10000,
+        // "" means the whole index. The vectorstore does the filtering, so the
+        // sample is drawn from this track rather than sieved out of a sample of
+        // everything — which is the point: a track holding 1% of the index
+        // would otherwise contribute 1% of the plot.
+        track: $("track").value,
       }),
     });
     const data = await res.json();
@@ -1356,6 +1400,7 @@ async function loadIndex() {
     state.viewState = initialViewState(data.bbox);
     initDeck();
     $("zoom").hidden = false;
+    drawTracks(data.tracks, data.track);
     drawLegend();
     state.stats = data;
     drawStats(data);
@@ -1364,10 +1409,41 @@ async function loadIndex() {
     $("empty").hidden = false;
     $("empty").querySelector("h1").textContent = "Could not load index";
     $("empty").querySelector("p").textContent = err.message;
+    // Nothing was loaded under the filter that was just attempted, so the
+    // header must not go on claiming it. Back to whatever is actually plotted.
+    $("track").value = state.stats?.track || "";
   } finally {
     busy(false);
     $("load").disabled = false;
   }
+}
+
+/** Fill the track selector from the loaded index, keeping `selected` chosen.
+ *
+ * The counts are the index's, not the plot's: they say how large each track is
+ * before any sampling, which is what makes them worth showing — the plotted
+ * count is already in the header and in the legend.
+ *
+ * Rebuilt on every load rather than only on the first, because a different QID
+ * has different tracks and a stale list would offer a filter that matches
+ * nothing.
+ */
+function drawTracks(tracks, selected) {
+  const select = $("track");
+  const names = Object.keys(tracks || {}).sort();
+  const total = Object.values(tracks || {}).reduce((a, b) => a + b, 0);
+
+  select.innerHTML =
+    `<option value="">All tracks${total ? ` (${total.toLocaleString()})` : ""}</option>` +
+    names
+      .map((n) => `<option value="${escapeHtml(n)}">${escapeHtml(n)} (${
+        (tracks[n] || 0).toLocaleString()})</option>`)
+      .join("");
+  // The server echoes what it actually loaded, so a filter it ignored or
+  // normalized does not leave the header claiming something else.
+  select.value = selected || "";
+  // An index reporting one track has nothing to choose between.
+  select.disabled = names.length < 2;
 }
 
 /* ---------------------------------------------------------------- search */
@@ -1429,22 +1505,22 @@ async function runSearch(mode, payload, label, preview) {
     flashLinks(q);
 
     const best = data.neighbours[0];
-    // The absolute number is worth showing but needs its scale named: SigLIP
-    // scores a text-to-image match an order of magnitude lower than an
-    // image-to-image one, so 0.07 from a text query is a strong hit.
+    // The score is the one thing here that cannot be read off the map. What
+    // this used to also say -- how many rows were searched, how many were
+    // added, what the links mean, that they fade -- is either already visible
+    // in the header and the legend or explained once in the help panel, and
+    // repeating it after every query made this something to dismiss rather
+    // than read.
     //
-    // The counts matter too: the plot is a sample, the search was not, so this
-    // says how many rows it actually ranked and how many of its hits are new to
-    // the map — otherwise a hit appearing out of nowhere reads as a glitch.
-    note.innerHTML = `Query placed. Searched the <b>whole index</b> and took its top
-      <b>${data.searched}</b>${data.points?.length
-        ? `, <b>${data.points.length}</b> of which were not in the sample and have been
-           added to the plot` : ""}.
-      Links mark the <b>${data.neighbours.length}</b> nearest of them by true cosine
-      similarity, not by distance on screen.
-      Best ${best ? `<b>${best.similarity.toFixed(3)}</b>` : "—"} — compare within a
-      ${mode} search, not across modes. Links fade after a moment — hover or
-      click the query node to bring them back.`;
+    // The caveat behind the number stays, as a tooltip: the scale is
+    // model-relative, and SigLIP scores a text-to-image match an order of
+    // magnitude lower than an image-to-image one, so 0.07 from a text query is
+    // a strong hit.
+    note.innerHTML = best ? `Best <b>${best.similarity.toFixed(3)}</b>` : "No matches.";
+    note.title = best
+      ? `Cosine similarity to the nearest vector, in the index's own dimensions. `
+        + `Compare within a ${mode} search, not across modes.`
+      : "";
     note.hidden = false;
     render();
   } catch (e) {
@@ -1484,6 +1560,13 @@ function searchFile(mode, input) {
 
 $("load").addEventListener("click", loadIndex);
 $("index-qid").addEventListener("keydown", (e) => e.key === "Enter" && loadIndex());
+// Unlike Sample and Projection, this does not wait for Load: it selects a
+// different set of vectors, which has to be re-fetched and re-projected before
+// anything on screen means anything.
+$("track").addEventListener("change", loadIndex);
+// A failed load leaves the selector showing a filter that was never applied.
+// Putting it back on the loaded index's track keeps it honest.
+$("index-qid").addEventListener("input", () => { $("track").value = ""; });
 
 document.querySelectorAll("#method button").forEach((b) =>
   b.addEventListener("click", () => {

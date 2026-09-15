@@ -1,0 +1,1509 @@
+definitions:
+  AddContentsRequest:
+    properties:
+      qids:
+        items:
+          type: string
+        type: array
+    required:
+    - qids
+    type: object
+  AddVectorsRequest:
+    properties:
+      batch_id:
+        description: |-
+          BatchID stamps every vector in the request with the batch it was written by.
+          One request is one write run, so the batch is set once here too; omit it to
+          upload vectors that belong to no batch. The batch must belong to the index in
+          the path, and its own content qid must agree with `qid`.
+        type: string
+      qid:
+        description: |-
+          QID is the content every vector in this request describes. One upload is one
+          content, so it is given once here rather than repeated on each vector.
+          Optional: with a batch_id it is taken from the batch, and vectors that
+          describe no content at all may omit both.
+        type: string
+      vectors:
+        items:
+          $ref: '#/definitions/CreateVectorRequest'
+        type: array
+    required:
+    - vectors
+    type: object
+  BinarySearchMetadataResponse:
+    properties:
+      byte_order:
+        type: string
+      count:
+        type: integer
+      dim:
+        type: integer
+      dtype:
+        type: string
+      results:
+        items:
+          $ref: '#/definitions/SearchResultResponse'
+        type: array
+    type: object
+  CollectionResponse:
+    properties:
+      id:
+        type: string
+      name:
+        type: string
+      qids:
+        items:
+          type: string
+        type: array
+      tenant:
+        type: string
+    type: object
+  CreateCollectionRequest:
+    properties:
+      name:
+        type: string
+      qids:
+        items:
+          type: string
+        type: array
+      tenant:
+        type: string
+    required:
+    - name
+    - tenant
+    type: object
+  CreateDocumentRequest:
+    properties:
+      additional_info:
+        additionalProperties: true
+        description: |-
+          AdditionalInfo is opaque metadata stored as JSONB and returned verbatim.
+          Unlike `fields` it is not indexed and cannot be searched -- use it for data
+          that travels with the document but is never queried.
+        type: object
+      end_time:
+        type: integer
+      fields:
+        additionalProperties:
+          items:
+            type: string
+          type: array
+        description: |-
+          Fields maps a field name to its value(s), e.g.
+          {"title": ["Episode 1"], "subtitles": ["hello", "world"]}. Each value is
+          stored as a searchable text field on the document.
+        type: object
+      frame_idx:
+        type: integer
+      qid:
+        type: string
+      start_time:
+        type: integer
+      track:
+        type: string
+      vector_ids:
+        description: |-
+          VectorIDs are vector instance ids in the same index to link this document
+          to. Each becomes a vector_documents edge from that instance to the new
+          document. Ids that don't exist or belong to another index are ignored.
+        items:
+          type: integer
+        type: array
+    required:
+    - track
+    type: object
+  CreateIndexRequest:
+    properties:
+      collection_id:
+        type: string
+      config:
+        additionalProperties: true
+        type: object
+      name:
+        type: string
+      type:
+        type: string
+      vector_size:
+        description: VectorSize is optional; when omitted (0) the service defaults
+          it.
+        type: integer
+    type: object
+  CreateVectorBatchRequest:
+    properties:
+      additional_info:
+        additionalProperties: true
+        type: object
+      author:
+        type: string
+      model:
+        type: string
+      qid:
+        type: string
+    required:
+    - model
+    - qid
+    type: object
+  CreateVectorRequest:
+    properties:
+      additional_info:
+        additionalProperties: true
+        description: |-
+          AdditionalInfo is opaque metadata stored as JSONB and returned verbatim on
+          search hits. Not indexed and not filterable.
+        type: object
+      document_ids:
+        description: |-
+          DocumentIDs are document UUIDs in the same index to link this vector to.
+          Each becomes a vector_documents edge from the new instance to that
+          document. Ids that don't exist or belong to another index are ignored.
+        items:
+          type: string
+        type: array
+      end_time:
+        type: integer
+      frame_idx:
+        type: integer
+      source:
+        type: string
+      start_time:
+        type: integer
+      text:
+        type: string
+      text_field_id:
+        description: |-
+          TextFieldID links this vector to a text_fields row; the autolink trigger
+          maps it to every document that field belongs to in the same index.
+        type: integer
+      track:
+        type: string
+      vector:
+        items:
+          type: number
+        type: array
+    required:
+    - track
+    - vector
+    type: object
+  DeleteDocumentsRequest:
+    properties:
+      qids:
+        items:
+          type: string
+        type: array
+      track:
+        type: string
+    type: object
+  DeleteDocumentsResponse:
+    properties:
+      text_fields_deleted:
+        type: integer
+    type: object
+  DeleteVectorsBySourceRequest:
+    properties:
+      model:
+        description: Only vectors belonging to batches with this model are deleted.
+        type: string
+      sources:
+        items:
+          type: string
+        minItems: 1
+        type: array
+    required:
+    - model
+    - sources
+    type: object
+  DocumentResponse:
+    properties:
+      additional_info:
+        additionalProperties: true
+        description: AdditionalInfo is the opaque metadata supplied when the document
+          was written.
+        type: object
+      distance:
+        description: |-
+          Distance is the best associated vector distance, populated only for
+          vector-ordered searches.
+        type: number
+      end_time:
+        type: integer
+      fields:
+        additionalProperties:
+          items:
+            type: string
+          type: array
+        description: 'Fields mirrors the write shape: field name -> values.'
+        type: object
+      frame_idx:
+        type: integer
+      id:
+        type: string
+      index_id:
+        type: string
+      match_info:
+        allOf:
+        - $ref: '#/definitions/MatchInfoResponse'
+        description: MatchInfo is populated only when include_match_info was requested.
+      qid:
+        type: string
+      score:
+        description: Score is the text-rank similarity, populated only for non-vector
+          text searches.
+        type: number
+      start_time:
+        type: integer
+      track:
+        type: string
+    type: object
+  FieldFilter:
+    properties:
+      field:
+        type: string
+      query:
+        type: string
+    type: object
+  IndexResponse:
+    properties:
+      collection_id:
+        type: string
+      config:
+        additionalProperties: true
+        type: object
+      name:
+        type: string
+      qid:
+        type: string
+      type:
+        type: string
+      vector_size:
+        type: integer
+    type: object
+  IndexStatsResponse:
+    properties:
+      tags:
+        $ref: '#/definitions/TagStats'
+    type: object
+  IndexTracksResponse:
+    properties:
+      tracks:
+        items:
+          $ref: '#/definitions/TrackCountResponse'
+        type: array
+    type: object
+  ListCollectionsResponse:
+    properties:
+      collections:
+        items:
+          $ref: '#/definitions/CollectionResponse'
+        type: array
+    type: object
+  MatchInfoResponse:
+    properties:
+      vectors:
+        $ref: '#/definitions/VectorMatchInfoResponse'
+    type: object
+  RemoveContentsRequest:
+    properties:
+      qids:
+        items:
+          type: string
+        type: array
+    required:
+    - qids
+    type: object
+  SearchDocumentsRequest:
+    properties:
+      end_time_gte:
+        type: integer
+      end_time_lte:
+        type: integer
+      fields:
+        description: |-
+          When set, this restricts results to documents containing the specified fields
+          and scoring will only take these field values into account.
+        items:
+          type: string
+        type: array
+      filters:
+        description: |-
+          Filters are websearch-style text matches, AND'd together. Each may be
+          scoped to a field or match any field.
+        items:
+          $ref: '#/definitions/FieldFilter'
+        type: array
+      include_match_info:
+        description: |-
+          IncludeMatchInfo, when true (with a vector), populates each result's
+          match_info with the top-scoring vector.
+        type: boolean
+      limit:
+        type: integer
+      qids:
+        items:
+          type: string
+        type: array
+      start_time_gte:
+        type: integer
+      start_time_lte:
+        type: integer
+      track:
+        type: string
+      vector:
+        description: |-
+          Vector, when set, orders matching documents by their best (minimum)
+          associated vector distance. Must match the index's vector dimension.
+        items:
+          type: number
+        type: array
+    type: object
+  SearchDocumentsResponse:
+    properties:
+      results:
+        items:
+          $ref: '#/definitions/DocumentResponse'
+        type: array
+    type: object
+  SearchRequest:
+    properties:
+      end_time_gte:
+        type: integer
+      end_time_lte:
+        type: integer
+      include_vector:
+        description: |-
+          IncludeVector, when true, returns each hit's stored embedding on the
+          result's `vector` field.
+        type: boolean
+      limit:
+        type: integer
+      post_filter:
+        type: boolean
+      qids:
+        items:
+          type: string
+        type: array
+      shuffle_seed:
+        type: integer
+      sources:
+        description: Sources narrows the search to vectors whose source is one of
+          these values.
+        items:
+          type: string
+        type: array
+      start_time_gte:
+        type: integer
+      start_time_lte:
+        type: integer
+      track:
+        type: string
+      vector:
+        items:
+          type: number
+        type: array
+    type: object
+  SearchResponse:
+    properties:
+      results:
+        items:
+          $ref: '#/definitions/SearchResultResponse'
+        type: array
+    type: object
+  SearchResultResponse:
+    properties:
+      distance:
+        type: number
+      vector:
+        $ref: '#/definitions/VectorResponse'
+    type: object
+  TagStats:
+    properties:
+      tracks:
+        additionalProperties:
+          $ref: '#/definitions/TrackStats'
+        type: object
+    type: object
+  TopScoringVectorResponse:
+    properties:
+      id:
+        type: integer
+      text:
+        description: Text is the vector instance's own text, if any.
+        type: string
+      text_field_value:
+        description: TextFieldValue is the content of the text field the vector references,
+          if any.
+        type: string
+    type: object
+  TrackCountResponse:
+    properties:
+      count:
+        type: integer
+      name:
+        type: string
+    type: object
+  TrackStats:
+    properties:
+      histogram:
+        additionalProperties:
+          type: integer
+        type: object
+    type: object
+  UpdateIndexRequest:
+    properties:
+      collection_id:
+        type: string
+      config:
+        additionalProperties: true
+        type: object
+      name:
+        type: string
+      type:
+        type: string
+    type: object
+  UpdateVectorBatchRequest:
+    properties:
+      additional_info:
+        additionalProperties: true
+        type: object
+    type: object
+  VectorBatchResponse:
+    properties:
+      additional_info:
+        additionalProperties: true
+        type: object
+      author:
+        type: string
+      created_at:
+        type: string
+      id:
+        type: string
+      index_id:
+        type: string
+      model:
+        type: string
+      qid:
+        type: string
+    type: object
+  VectorMatchInfoResponse:
+    properties:
+      top_scoring:
+        $ref: '#/definitions/TopScoringVectorResponse'
+    type: object
+  VectorResponse:
+    properties:
+      additional_info:
+        additionalProperties: true
+        description: AdditionalInfo is the opaque metadata supplied when the vector
+          was written.
+        type: object
+      batch_id:
+        type: string
+      end_time:
+        type: integer
+      frame_idx:
+        type: integer
+      id:
+        type: integer
+      index_id:
+        type: string
+      qid:
+        type: string
+      source:
+        type: string
+      start_time:
+        type: integer
+      text:
+        type: string
+      text_field_id:
+        type: integer
+      track:
+        type: string
+      vector:
+        description: |-
+          Vector is the stored embedding, returned only when include_vector was
+          requested. Values are as stored (halfvec), not the exact floats written.
+        items:
+          type: number
+        type: array
+    type: object
+info:
+  contact: {}
+  description: |-
+    CRUD and vector-search HTTP API for the elv-vectorstore service.
+    Each index backs onto its own HNSW-indexed pgvector partition;
+    searches default to pre-filtering for exact KNN over filtered subsets.
+  title: Vectorstore API
+  version: "1.0"
+paths:
+  /collections:
+    get:
+      description: |-
+        Lists all collections belonging to a tenant.
+        Requires tenant admin credentials against the tenant id in the query.
+      operationId: vectorstore-list-collections
+      parameters:
+      - description: Tenant id
+        in: query
+        name: tenant
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/ListCollectionsResponse'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties: true
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties: true
+            type: object
+      summary: List collections by tenant
+      tags:
+      - Collections
+    post:
+      description: |-
+        Creates a new collection of content ids belonging to a tenant.
+        Requires tenant admin credentials against the tenant id in the body.
+      operationId: vectorstore-create-collection
+      parameters:
+      - description: Collection payload
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/CreateCollectionRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: collection_id and message
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: invalid request
+          schema:
+            additionalProperties: true
+            type: object
+        "403":
+          description: not a tenant admin
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Create a collection
+      tags:
+      - Collections
+  /collections/{id}:
+    get:
+      description: Requires tenant admin credentials against the collection's tenant.
+      operationId: vectorstore-get-collection
+      parameters:
+      - description: Collection ID (UUID)
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/CollectionResponse'
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties: true
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Get a collection
+      tags:
+      - Collections
+  /collections/{id}/contents:
+    delete:
+      description: |-
+        Removes content ids from the collection.
+        Requires tenant admin for the collection's tenant.
+      operationId: vectorstore-remove-contents
+      parameters:
+      - description: Collection ID (UUID)
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: QIDs to remove
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/RemoveContentsRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties: true
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties: true
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Remove content ids from a collection
+      tags:
+      - Collections
+    post:
+      description: |-
+        Appends content ids to the collection (deduplicated).
+        Requires tenant admin for the collection's tenant AND content
+        access for every qid being added.
+      operationId: vectorstore-add-contents
+      parameters:
+      - description: Collection ID (UUID)
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: QIDs to add
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/AddContentsRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties: true
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties: true
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Add content ids to a collection
+      tags:
+      - Collections
+  /documents/{id}:
+    get:
+      description: |-
+        Returns the document with its fields (a map of field name -> values).
+        Requires content access for the document's index qid.
+      operationId: vectorstore-get-document
+      parameters:
+      - description: Document ID (UUID)
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/DocumentResponse'
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties: true
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Get a document
+      tags:
+      - Documents
+  /indexes/{qid}:
+    get:
+      description: Requires content access for the index qid.
+      operationId: vectorstore-get-index
+      parameters:
+      - description: Index content ID
+        in: path
+        name: qid
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/IndexResponse'
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties: true
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Get a vector index
+      tags:
+      - Indexes
+    patch:
+      description: |-
+        Updates the metadata of a vector index.
+        Requires content access for the index qid. When the update associates
+        a collection, also requires tenant admin for the collection's tenant.
+      operationId: vectorstore-update-index
+      parameters:
+      - description: Index content ID
+        in: path
+        name: qid
+        required: true
+        type: string
+      - description: Fields to update
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/UpdateIndexRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties: true
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties: true
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Update a vector index
+      tags:
+      - Indexes
+    post:
+      description: |-
+        Creates a searchable vector index enabling semantic search over documents and vectors.
+        Requires content access for the index qid. When a collection is
+        associated, also requires tenant admin for the collection's tenant.
+      operationId: vectorstore-create-index
+      parameters:
+      - description: Index content ID
+        in: path
+        name: qid
+        required: true
+        type: string
+      - description: Index payload
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/CreateIndexRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties: true
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Create a vector index
+      tags:
+      - Indexes
+  /indexes/{qid}/batches:
+    post:
+      description: |-
+        Registers a batch of vectors for an index. This is not required
+        but it recommended for grouping large uploads such that metadata can be attached to the whole
+        batch, and the batch can be deleted in one operation. The qid in the path is the index being written into.
+        Requires content access for the index qid.
+        for grouping large uploads such that metadata can be attached to the whole
+        batch, and the batch can be deleted in one operation.
+      operationId: vectorstore-create-vector-batch
+      parameters:
+      - description: Index content ID
+        in: path
+        name: qid
+        required: true
+        type: string
+      - description: Batch payload
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/CreateVectorBatchRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties: true
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties: true
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Create a vector batch
+      tags:
+      - Vectors
+  /indexes/{qid}/batches/{batch_id}:
+    delete:
+      description: |-
+        Deletes the batch and every vector uploaded under it, reporting how
+        many vectors went with it in `deleted`. The batch must belong to the
+        index in the path -- a batch of another index is a 404 -- so the delete
+        never reaches outside that index.
+        Vector storage left with no remaining vector is garbage-collected.
+        Documents and text fields survive -- only the edges linking them to the
+        deleted vectors go away.
+        Requires content access for the index qid.
+      operationId: vectorstore-delete-vector-batch
+      parameters:
+      - description: Index content ID
+        in: path
+        name: qid
+        required: true
+        type: string
+      - description: Batch ID
+        in: path
+        name: batch_id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties: true
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties: true
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Delete a vector batch
+      tags:
+      - Vectors
+    get:
+      description: |-
+        Returns the batch registered under the given index. The batch must
+        belong to the index in the path -- a batch of another index is a 404.
+        Requires content access for the index qid.
+      operationId: vectorstore-get-vector-batch
+      parameters:
+      - description: Index content ID
+        in: path
+        name: qid
+        required: true
+        type: string
+      - description: Batch ID
+        in: path
+        name: batch_id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/VectorBatchResponse'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties: true
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties: true
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Get a vector batch
+      tags:
+      - Vectors
+    patch:
+      operationId: vectorstore-update-vector-batch
+      parameters:
+      - description: Index content ID
+        in: path
+        name: qid
+        required: true
+        type: string
+      - description: Batch ID
+        in: path
+        name: batch_id
+        required: true
+        type: string
+      - description: Fields to update
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/UpdateVectorBatchRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties: true
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties: true
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Update a vector batch
+      tags:
+      - Vectors
+  /indexes/{qid}/documents:
+    delete:
+      description: Deletes documents in the index matching the query
+      operationId: vectorstore-delete-documents
+      parameters:
+      - description: Index content ID
+        in: path
+        name: qid
+        required: true
+        type: string
+      - description: Delete request
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/DeleteDocumentsRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/DeleteDocumentsResponse'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties: true
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties: true
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Delete documents from an index
+      tags:
+      - Documents
+    post:
+      description: |-
+        Inserts a document into the given index. The document's `fields`
+        (a map of field name -> values) are stored as searchable text
+        fields; `additional_info` is stored opaquely and is NOT searchable.
+        Optionally links the document to a batch of vector ids
+        The associated vector ids can be used for semantic ordering on top of document search.
+        Requires content access for the index qid.
+      operationId: vectorstore-add-document
+      parameters:
+      - description: Index content ID
+        in: path
+        name: qid
+        required: true
+        type: string
+      - description: Document payload
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/CreateDocumentRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties: true
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties: true
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Add a document to an index
+      tags:
+      - Documents
+  /indexes/{qid}/documents/search:
+    post:
+      description: |-
+        Returns documents in the given index matching the supplied
+        `filters`. When a `vector` is specified, matching documents are
+        returned in order of their minimum associated vector distance with the query vector.
+        This enables semantic ranking of the returned documents.
+        Requires content access for the index qid.
+      operationId: vectorstore-search-documents
+      parameters:
+      - description: Index content ID
+        in: path
+        name: qid
+        required: true
+        type: string
+      - description: Search request
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/SearchDocumentsRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/SearchDocumentsResponse'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties: true
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties: true
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Document search
+      tags:
+      - Documents
+  /indexes/{qid}/search:
+    post:
+      description: |-
+        Searches the given index by cosine distance to the query vector.
+        Also supports additional filters on the vector metadata.
+        `vector` is optional: if provided it only affects the sorting.
+        A negative `limit` means no limit; an unset one defaults to 100.
+        Requires content access for the index qid.
+      operationId: vectorstore-search
+      parameters:
+      - description: Index content ID
+        in: path
+        name: qid
+        required: true
+        type: string
+      - description: Search request
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/SearchRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/SearchResponse'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties: true
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties: true
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Vector search on an index
+      tags:
+      - Vectors
+  /indexes/{qid}/search/binary:
+    post:
+      description: |-
+        Same request as /search, but the embeddings come back as raw bytes
+        instead of JSON numbers. The response is a `multipart/mixed` body of
+        two parts: a `metadata` part (`application/json`) holding the hit
+        metadata plus the binary layout, and a `vectors` part
+        (`application/octet-stream`) holding every hit's embedding
+        concatenated into one flat little-endian float32 array.
+      operationId: vectorstore-search-binary
+      parameters:
+      - description: Index content ID
+        in: path
+        name: qid
+        required: true
+        type: string
+      - description: Search request
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/SearchRequest'
+      produces:
+      - multipart/mixed
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/BinarySearchMetadataResponse'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties: true
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties: true
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Vector search returning the embeddings as binary
+      tags:
+      - Vectors
+  /indexes/{qid}/search/unique:
+    post:
+      description: |-
+        Same parameters as /search, but returns at most one unique vector
+        instance per matching vector: duplicate vectors are filtered out.
+        Requires content access for the index qid.
+      operationId: vectorstore-search-unique
+      parameters:
+      - description: Index content ID
+        in: path
+        name: qid
+        required: true
+        type: string
+      - description: Search request
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/SearchRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/SearchResponse'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties: true
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties: true
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Deduplicated vector search on an index
+      tags:
+      - Vectors
+  /indexes/{qid}/stats:
+    get:
+      operationId: vectorstore-get-index-stats
+      parameters:
+      - description: Index content ID
+        in: path
+        name: qid
+        required: true
+        type: string
+      - description: Comma-separated field names to limit the histogram to (defaults
+          to all fields)
+        in: query
+        name: tracks
+        type: string
+      - description: Max distinct values surfaced per field, highest count first (defaults
+          to the built-in default)
+        in: query
+        name: max_results
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/IndexStatsResponse'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties: true
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties: true
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Get field statistics for a vector index
+      tags:
+      - Indexes
+  /indexes/{qid}/tracks:
+    get:
+      description: |-
+        Returns the distinct vector tracks within the index, along with their vector counts.
+        Requires content access for the index qid.
+      operationId: vectorstore-get-index-tracks
+      parameters:
+      - description: Index content ID
+        in: path
+        name: qid
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/IndexTracksResponse'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties: true
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties: true
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties: true
+            type: object
+      summary: List the vector tracks of an index
+      tags:
+      - Indexes
+  /indexes/{qid}/vectors:
+    delete:
+      description: |-
+        Bulk-deletes every vector in the index that was written by a batch with
+        the given `model` and whose own `source` is any of the given `sources`.
+        Vectors with no batch or no source are never matched. The batch rows
+        themselves are kept: a batch may span several sources, so emptying one of
+        them does not retire the batch. Vector storage left with no remaining
+        vector is garbage-collected; documents and text fields are untouched.
+        Requires content access for the index qid.
+      operationId: vectorstore-delete-vectors-by-source
+      parameters:
+      - description: Index content ID
+        in: path
+        name: qid
+        required: true
+        type: string
+      - description: Model and sources to delete
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/DeleteVectorsBySourceRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties: true
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties: true
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Delete an index's vectors by model and source
+      tags:
+      - Vectors
+    post:
+      description: |-
+        Inserts one or more vectors into the given index. Each vector must
+        match the index's configured vector dimension. Each may carry an
+        `additional_info` object, stored as-is and returned on search hits.
+        One request is one write run over one piece of content, so `qid` and
+        `batch_id` are given once at the top level and apply to every vector --
+        uploading vectors for several contents means one request each. The
+        batch must belong to the index in the path and its own content qid
+        must agree with `qid`; when `batch_id` is given and `qid` is not, the
+        batch supplies it. Both may be omitted: no `batch_id` writes vectors
+        that belong to no batch, and no `qid` writes vectors that describe no
+        content.
+        Requires content access for the index qid.
+      operationId: vectorstore-add-vectors
+      parameters:
+      - description: Index content ID
+        in: path
+        name: qid
+        required: true
+        type: string
+      - description: Vectors batch
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/AddVectorsRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties: true
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties: true
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Add vectors to an index
+      tags:
+      - Vectors
+swagger: "2.0"

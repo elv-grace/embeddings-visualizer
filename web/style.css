@@ -112,6 +112,20 @@ input[type="text"], input[type="number"] {
 }
 input[type="number"] { width: 92px; }
 input:focus { outline: none; border-color: var(--accent); }
+
+/* Matches the text inputs it sits beside in the header. max-width so a track
+   named after a long tagger does not push the rest of the bar off-screen. */
+select {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  color: var(--text);
+  padding: 6px 9px;
+  font: inherit;
+  max-width: 190px;
+}
+select:focus { outline: none; border-color: var(--accent); }
+select:disabled { opacity: .5; cursor: default; }
 input::placeholder { color: #574f70; }
 
 button {
@@ -559,6 +573,12 @@ button.help:hover { color: var(--text); border-color: var(--accent); }
 #media-full figcaption {
   margin-top: 8px; text-align: center;
   font-size: 12px; color: var(--muted);
+}
+/* The text a caption vector was embedded from, under the clip it names:
+   checking the two against each other is the whole reason to play a text row. */
+#media-full figcaption .said {
+  margin: 6px auto 0; max-width: 62ch;
+  color: var(--text); font-style: italic; white-space: pre-wrap;
 }
 #media-full .close {
   position: absolute; top: 12px; right: 14px;

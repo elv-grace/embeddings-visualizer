@@ -108,6 +108,7 @@ def _search(
     shuffle_seed: Optional[int] = None,
     include_vector: bool = False,
     sources: Optional[List[str]] = None,
+    track: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """POST /indexes/{qid}/search and return the raw result rows.
 
@@ -122,6 +123,8 @@ def _search(
     # Omitted rather than sent empty: an empty filter is not always a no-op.
     if sources:
         body["sources"] = sources
+    if track:
+        body["track"] = track
 
     response = requests.post(
         f"{VECTORSTORE_URL}/indexes/{index_qid}/search",
@@ -237,18 +240,28 @@ def get_vectors(
     sources: Optional[List[str]] = None,
     sample_size: int = DEFAULT_SAMPLE_SIZE,
     seed: int = 0,
+    track: Optional[str] = None,
 ) -> Tuple[List[List[float]], List[Dict[str, Any]]]:
     """Return (vectors, metadata) for a random sample of the index.
 
     Positionally aligned: metadata[i] describes vectors[i]. The sample is the
     whole index when it holds fewer than sample_size rows, and is drawn in one
     shuffled read -- see this module's docstring.
+
+    `track` narrows the read to one track, and narrows it *in the vectorstore*:
+    the sample is then drawn from that track's rows rather than filtered out of
+    a sample of everything, so a track holding 1% of the index still fills the
+    plot instead of contributing 1% of it.
     """
     track_counts = get_track_counts(index_qid, auth_token)
     if track_counts:
         logger.info(f"Tracks: {track_counts} (total {sum(track_counts.values())})")
 
-    logger.info(f"Reading up to {sample_size} vectors in shuffled order...")
+    logger.info(
+        f"Reading up to {sample_size} vectors in shuffled order"
+        + (f" from track `{track}`" if track else "")
+        + "..."
+    )
     rows = _search(
         index_qid,
         auth_token,
@@ -256,14 +269,18 @@ def get_vectors(
         shuffle_seed=_shuffle_seed(seed),
         include_vector=True,
         sources=sources,
+        track=track,
     )
     vectors, metadata = _unpack(rows)
 
-    population = sum(track_counts.values())
+    # What the sample was drawn from: the filtered track when there is one, not
+    # the whole index.
+    population = track_counts.get(track, 0) if track else sum(track_counts.values())
     logger.info(
         f"Retrieved {len(vectors)}"
         + (f" of {population}" if population else "")
         + f" vectors from index `{index_qid}`"
+        + (f" track `{track}`" if track else "")
     )
     return vectors, metadata
 
@@ -274,6 +291,7 @@ def search_vectors(
     vector: Sequence[float],
     limit: int = SEARCH_LIMIT,
     sources: Optional[List[str]] = None,
+    track: Optional[str] = None,
 ) -> Tuple[List[List[float]], List[Dict[str, Any]]]:
     """Return (vectors, metadata) for the `limit` nearest rows to `vector`.
 
@@ -282,6 +300,11 @@ def search_vectors(
     to place the hits in a projection fitted elsewhere and rank them itself --
     the response's `distance` is not returned, so that one scale governs both
     the sampled points and these.
+
+    `track` is the filter the plot was loaded under, and it applies here for the
+    same reason the filter exists: the hits are added to that plot, and a match
+    from a track the viewer filtered out would arrive as a node they had asked
+    not to see.
     """
     rows = _search(
         index_qid,
@@ -290,6 +313,7 @@ def search_vectors(
         vector=vector,
         include_vector=True,
         sources=sources,
+        track=track,
     )
     return _unpack(rows)
 

@@ -110,6 +110,14 @@ request's `seed`, so the same index draws the same sample — and the same
 picture — on every run. The browser receives 2D coordinates plus metadata,
 never vectors.
 
+**A track is filtered in the vectorstore, not in the browser.** An index is
+written in tracks, one per tagger that contributed to it. Picking one in the
+header re-fetches the index with `track` set on the search, so the sample is
+drawn from that track's rows — a track holding 1% of the index fills the plot
+instead of contributing 1% of it. The filter carries into search for the same
+reason it exists: hits are added to the plot, and a match from a track the
+viewer filtered out would arrive as a node they asked not to see.
+
 **A search sees the whole index, not the sample.** The sample bounds what is
 *drawn*; letting it bound what is *findable* would make every query a search of
 ten thousand arbitrary rows. So a query is ranked by the vectorstore itself — an
@@ -204,11 +212,18 @@ frame is addressed against the trimmed timeline, not the one taggers record
 timestamps against.
 
 **Clips play their own segment**, seeking to `start_time` and pausing at
-`end_time`. A row needs `end_time > start_time` to be a video at all; one
-without it describes no extent and is reported as such in the detail panel
-rather than guessed at. That happens to rows written before whole-media tags
-carried a real duration — the pipeline re-based a `start == end == 0` sentinel
-into both fields — and the fix is to re-tag.
+`end_time`. What gets a player is decided by the time range, not by the
+modality: a caption or transcript vector is classified `text` because it carries
+text, but it was embedded from a span of the same timeline a shot vector
+describes, so it plays too — with the text quoted above the clip, which is how
+you check the caption against what was actually on screen. A frame is an instant
+(`start == end`) and gets its still instead.
+
+A row needs `end_time > start_time` to have anything to play; one without it
+describes no extent and is reported as such in the detail panel rather than
+guessed at. That happens to rows written before whole-media tags carried a real
+duration — the pipeline re-based a `start == end == 0` sentinel into both fields
+— and the fix is to re-tag.
 
 ---
 

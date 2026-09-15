@@ -126,6 +126,9 @@ class LoadedIndex:
     modes: List[str]
     model_id: str
     tracks: Dict[str, int] = field(default_factory=dict)
+    # The track this plot was loaded under, or None for the whole index. Held
+    # because a query has to be filtered the same way -- see `search_vectors`.
+    track: Optional[str] = None
     # The model each batch in this index reports, and the one queries embed
     # with. `model` is the first -- one index can hold batches from different
     # taggers, but a query has to be embedded with one model, so the response
@@ -226,10 +229,17 @@ def create_app(static_dir: str = "../web") -> Flask:
         sources = body.get("sources") or None
         sample_size = int(body.get("sample_size") or DEFAULT_SAMPLE_SIZE)
         seed = int(body.get("seed") or 0)
+        # Empty string and absent mean the same thing: the whole index.
+        track = (body.get("track") or "").strip() or None
 
         try:
             vectors, metadata = get_vectors(
-                index_qid, token, sources=sources, sample_size=sample_size, seed=seed
+                index_qid,
+                token,
+                sources=sources,
+                sample_size=sample_size,
+                seed=seed,
+                track=track,
             )
         except VectorStoreError as exc:
             return _error(str(exc), 400)
@@ -248,6 +258,15 @@ def create_app(static_dir: str = "../web") -> Flask:
             except Exception:
                 counts = {}
             total = sum(counts.values())
+            if track and track not in counts:
+                # Much the likeliest cause once a filter is involved, and the
+                # one the viewer can act on: name the tracks that do exist.
+                logger.warning(f"index {index_qid} has no track {track!r}; tracks={counts}")
+                return _error(
+                    f"index {index_qid} has no track {track!r}; it holds "
+                    + (f"{sorted(counts)}" if counts else "no tracks at all"),
+                    404,
+                )
             detail = (
                 f"but its tracks report {total} rows ({counts}) -- the search returned "
                 "no embeddings for them, so check the index holds vectors and not only "
@@ -256,7 +275,12 @@ def create_app(static_dir: str = "../web") -> Flask:
                 else "and its tracks report no rows either, so the index is empty"
             )
             logger.warning(f"index {index_qid} enumerated 0 rows; tracks={counts}")
-            return _error(f"index {index_qid} returned no vectors, {detail}", 404)
+            return _error(
+                f"index {index_qid}"
+                + (f" track {track!r}" if track else "")
+                + f" returned no vectors, {detail}",
+                404,
+            )
 
         try:
             tracks = get_track_counts(index_qid, token)
@@ -319,6 +343,7 @@ def create_app(static_dir: str = "../web") -> Flask:
                 tracks=tracks,
                 models=models,
                 tuning=tuning,
+                track=track,
             )
 
         return jsonify(
@@ -332,6 +357,9 @@ def create_app(static_dir: str = "../web") -> Flask:
                 "count": len(metadata),
                 "vector_size": int(matrix.shape[1]),
                 "tracks": tracks,
+                # Echoed rather than assumed: the frontend keeps the header's
+                # selector on whatever was actually loaded.
+                "track": track,
                 # Empty when nothing was stamped. When it is not, these are the
                 # container's --params, so the query is embedded under the same
                 # recipe the index was tagged with.
@@ -411,7 +439,11 @@ def create_app(static_dir: str = "../web") -> Flask:
 
         try:
             hits, hit_meta = search_vectors(
-                loaded.index_qid, token, query.tolist(), limit=SEARCH_LIMIT
+                loaded.index_qid,
+                token,
+                query.tolist(),
+                limit=SEARCH_LIMIT,
+                track=loaded.track,
             )
         except VectorStoreError as exc:
             return _error(str(exc), 400)
@@ -419,7 +451,10 @@ def create_app(static_dir: str = "../web") -> Flask:
             return _error(f"could not search index: {exc}", 502)
         if not hits:
             return _error(
-                f"index {loaded.index_qid} returned no hits for this query", 404
+                f"index {loaded.index_qid}"
+                + (f" track {loaded.track!r}" if loaded.track else "")
+                + " returned no hits for this query",
+                404,
             )
 
         matrix = np.asarray(hits, dtype=np.float32)
@@ -466,6 +501,9 @@ def create_app(static_dir: str = "../web") -> Flask:
                 # to know the search saw the whole index, not just the sample.
                 "searched": len(hits),
                 "count": count,
+                # Non-null when the plot is filtered, so the frontend can say
+                # the search was narrowed the same way.
+                "track": loaded.track,
                 # The hits that were not in the sample, ready to append. `i` is
                 # already their position in the loaded set, which is what
                 # `neighbours[].index` refers to.
